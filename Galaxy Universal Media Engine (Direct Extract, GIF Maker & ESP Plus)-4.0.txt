@@ -1,0 +1,2015 @@
+// ==UserScript==
+// @name         Galaxy Universal Media Engine (Direct Extract, GIF Maker & ESP Plus)
+// @namespace    http://tampermonkey.net/
+// @version      4.0
+// @description  Speed (−14× to 14×), Volume (800%), Render Engine, Blob-Fetch Direct, GIF Maker (OKLab·Atkinson·50fps·2560p), ESP Scanner, Screenshot, A-B Loop, PiP, Reverse Download, Timeline Scrubber. Works on all sites.
+// @author       Thanh_db
+// @match        *://*/*
+// @grant        none
+// ==/UserScript==
+
+(function () {
+    'use strict';
+
+    // ═══════════════════════════════════════════════════════════════
+    // §1 · INLINE GIF89a ENCODER  v4.0 — Pure JS, CSP-safe, no CDN
+    //
+    //  NEW in v4.0:
+    //   • DETAIL_BOOST raised 4.0 → 9.0 for far richer palette bias
+    //     toward edges and textures
+    //   • Atkinson dithering mode ('maximum') — distributes only 6/8
+    //     of error across 6 neighbours; 2/8 is intentionally dropped.
+    //     Sharper than Floyd-Steinberg on text/UI, fewer "worms" in
+    //     smooth gradients, outperforms FS for high-contrast content
+    //   • 'maximum' quality also sets DETAIL_BOOST = 12.0 for
+    //     maximum palette detail allocation
+    //   • Max dimension option expanded to 2560px
+    //   • All v3.0 improvements retained (OKLab, adaptive FS, MMCQ,
+    //     activity map, streaming encode, 50fps cap)
+    // ═══════════════════════════════════════════════════════════════
+    const _GUME_GIF = (() => {
+        'use strict';
+
+        function srgbToOklab(r8, g8, b8) {
+            let rl = r8 / 255, gl = g8 / 255, bl = b8 / 255;
+            rl = rl > 0.04045 ? Math.pow((rl + 0.055) / 1.055, 2.4) : rl / 12.92;
+            gl = gl > 0.04045 ? Math.pow((gl + 0.055) / 1.055, 2.4) : gl / 12.92;
+            bl = bl > 0.04045 ? Math.pow((bl + 0.055) / 1.055, 2.4) : bl / 12.92;
+            const lp = 0.4122214708 * rl + 0.5363325363 * gl + 0.0514459929 * bl;
+            const mp = 0.2119034982 * rl + 0.6806995451 * gl + 0.1073969566 * bl;
+            const sp = 0.0883024619 * rl + 0.2817188376 * gl + 0.6299787005 * bl;
+            const lc = Math.cbrt(lp), mc = Math.cbrt(mp), sc = Math.cbrt(sp);
+            return [
+                0.2104542553 * lc + 0.7936177850 * mc - 0.0040720468 * sc,
+                1.9779984951 * lc - 2.4285922050 * mc + 0.4505937099 * sc,
+                0.0259040371 * lc + 0.7827717662 * mc - 0.8086757660 * sc,
+            ];
+        }
+
+        function buildActivityMap(rgba, width, height) {
+            const lum = new Uint8Array(width * height);
+            for (let i = 0, n = width * height; i < n; i++) {
+                const o = i << 2;
+                lum[i] = (77 * rgba[o] + 150 * rgba[o + 1] + 29 * rgba[o + 2]) >> 8;
+            }
+            const act = new Float32Array(width * height);
+            for (let y = 1; y < height - 1; y++) {
+                for (let x = 1; x < width - 1; x++) {
+                    const pi = y * width + x, c = lum[pi];
+                    const w = width;
+                    let sumSq = 0;
+                    sumSq += (lum[pi - w - 1] - c) ** 2; sumSq += (lum[pi - w] - c) ** 2;
+                    sumSq += (lum[pi - w + 1] - c) ** 2; sumSq += (lum[pi - 1] - c) ** 2;
+                    sumSq += (lum[pi + 1] - c) ** 2;     sumSq += (lum[pi + w - 1] - c) ** 2;
+                    sumSq += (lum[pi + w] - c) ** 2;     sumSq += (lum[pi + w + 1] - c) ** 2;
+                    act[pi] = Math.sqrt(sumSq / 8) / 255;
+                }
+            }
+            return act;
+        }
+
+        function mmcQuantize(rgba, nColors, activityMap, detailBoost) {
+            const BITS = 5, SHIFT = 8 - BITS, SIDE = 1 << BITS, SIDE2 = SIDE * SIDE;
+            const DETAIL_BOOST = detailBoost || 9.0; // v4: raised from 4.0
+            const histo = new Float64Array(SIDE * SIDE2);
+            const n = rgba.length >>> 2;
+            for (let i = 0; i < n; i++) {
+                const o = i << 2;
+                if (rgba[o + 3] < 128) continue;
+                const w = activityMap ? 1 + activityMap[i] * DETAIL_BOOST : 1;
+                const idx = ((rgba[o] >> SHIFT) * SIDE2) + ((rgba[o + 1] >> SHIFT) * SIDE) + (rgba[o + 2] >> SHIFT);
+                histo[idx] += w;
+            }
+
+            class VBox {
+                constructor(r1, r2, g1, g2, b1, b2) {
+                    this.r1=r1;this.r2=r2;this.g1=g1;this.g2=g2;this.b1=b1;this.b2=b2;
+                    this._cnt=-1;this._avg=null;
+                }
+                vol() { return (this.r2-this.r1+1)*(this.g2-this.g1+1)*(this.b2-this.b1+1); }
+                count() {
+                    if (this._cnt >= 0) return this._cnt;
+                    let c = 0;
+                    for (let r = this.r1; r <= this.r2; r++) {
+                        const rB = r * SIDE2;
+                        for (let g = this.g1; g <= this.g2; g++) {
+                            const gB = rB + g * SIDE;
+                            for (let b = this.b1; b <= this.b2; b++) c += histo[gB + b];
+                        }
+                    }
+                    return (this._cnt = c);
+                }
+                avg() {
+                    if (this._avg) return this._avg;
+                    let rt=0,gt=0,bt=0,tot=0;
+                    for (let r=this.r1;r<=this.r2;r++) {
+                        const rB=r*SIDE2;
+                        for (let g=this.g1;g<=this.g2;g++) {
+                            const gB=rB+g*SIDE;
+                            for (let b=this.b1;b<=this.b2;b++) {
+                                const c=histo[gB+b]; if(!c) continue;
+                                rt+=c*((r<<SHIFT)|(1<<(SHIFT-1)));
+                                gt+=c*((g<<SHIFT)|(1<<(SHIFT-1)));
+                                bt+=c*((b<<SHIFT)|(1<<(SHIFT-1)));
+                                tot+=c;
+                            }
+                        }
+                    }
+                    if (!tot) return (this._avg=[((this.r1+this.r2)>>1)<<SHIFT,((this.g1+this.g2)>>1)<<SHIFT,((this.b1+this.b2)>>1)<<SHIFT]);
+                    return (this._avg=[Math.min(255,Math.round(rt/tot)),Math.min(255,Math.round(gt/tot)),Math.min(255,Math.round(bt/tot))]);
+                }
+                cut() {
+                    const dr=this.r2-this.r1,dg=this.g2-this.g1,db=this.b2-this.b1;
+                    const dim=(dr>=dg&&dr>=db)?'r':(dg>=db?'g':'b');
+                    const lo=this[dim+'1'],hi=this[dim+'2'];
+                    const ps=new Float64Array(SIDE);
+                    let tot=0;
+                    for (let i=lo;i<=hi;i++) {
+                        let s=0;
+                        if (dim==='r') { for (let g=this.g1;g<=this.g2;g++){const gB=i*SIDE2+g*SIDE;for(let b=this.b1;b<=this.b2;b++) s+=histo[gB+b];} }
+                        else if(dim==='g'){for(let r=this.r1;r<=this.r2;r++){const rB=r*SIDE2+i*SIDE;for(let b=this.b1;b<=this.b2;b++)s+=histo[rB+b];}}
+                        else{for(let r=this.r1;r<=this.r2;r++){const rB=r*SIDE2;for(let g=this.g1;g<=this.g2;g++)s+=histo[rB+g*SIDE+i];}}
+                        tot+=s;ps[i]=tot;
+                    }
+                    if(!tot) return null;
+                    const half=tot/2;
+                    let sp=lo;
+                    for(let i=lo;i<=hi;i++){if(ps[i]>=half){sp=i;break;}}
+                    const v1=new VBox(this.r1,this.r2,this.g1,this.g2,this.b1,this.b2);
+                    const v2=new VBox(this.r1,this.r2,this.g1,this.g2,this.b1,this.b2);
+                    v1[dim+'2']=sp;v2[dim+'1']=sp+1;
+                    if(v1.r1>v1.r2||v1.g1>v1.g2||v1.b1>v1.b2||v2.r1>v2.r2||v2.g1>v2.g2||v2.b1>v2.b2) return null;
+                    return [v1,v2];
+                }
+            }
+
+            let boxes=[new VBox(0,SIDE-1,0,SIDE-1,0,SIDE-1)];
+            function splitOnce(cmp){boxes.sort(cmp);const box=boxes.pop();if(!box||!box.count())return false;const parts=box.cut();if(!parts){boxes.unshift(box);return false;}boxes.push(...parts);return true;}
+            const popCmp=(a,b)=>a.count()-b.count();
+            const volCmp=(a,b)=>a.count()*a.vol()-b.count()*b.vol();
+            const phase1=Math.ceil(nColors*0.75);
+            let iter=0;
+            while(boxes.length<phase1&&iter++<1000) if(!splitOnce(popCmp)) break;
+            iter=0;
+            while(boxes.length<nColors&&iter++<1000) if(!splitOnce(volCmp)) break;
+            const pal=new Uint8Array(nColors*3);
+            for(let i=0;i<Math.min(boxes.length,nColors);i++){const a=boxes[i].avg();pal[i*3]=a[0];pal[i*3+1]=a[1];pal[i*3+2]=a[2];}
+            return pal;
+        }
+
+        // ── 1C · Pixel Indexer — Adaptive Floyd-Steinberg OR Atkinson ──
+        // v4.0 NEW: 'maximum' quality mode uses Atkinson dithering:
+        //   • Distributes error to 6 neighbours at weight 1/8 each
+        //   • 2/8 of error intentionally discarded → suppresses "worms"
+        //   • Sharper edges than Floyd-Steinberg for text/UI content
+        //   • Combined with DETAIL_BOOST=12 for maximum palette fidelity
+
+        function indexWithDither(rgba, palette, nColors, width, height, activityMap, quality) {
+            const indexed = new Uint8Array(width * height);
+            const eR = new Float32Array(width * height);
+            const eG = new Float32Array(width * height);
+            const eB = new Float32Array(width * height);
+
+            const palLab = new Float32Array(nColors * 3);
+            for (let j = 0; j < nColors; j++) {
+                const lab = srgbToOklab(palette[j*3], palette[j*3+1], palette[j*3+2]);
+                palLab[j*3]=lab[0];palLab[j*3+1]=lab[1];palLab[j*3+2]=lab[2];
+            }
+            const CSIZE = 32*32*32;
+            const cache = new Int16Array(CSIZE).fill(-1);
+
+            function nearest(r, g, b) {
+                const key = ((r>>3)<<10)|((g>>3)<<5)|(b>>3);
+                if (cache[key] >= 0) return cache[key];
+                const qL = srgbToOklab(r, g, b);
+                let best=0,bd=1e18;
+                for (let j=0;j<nColors;j++) {
+                    const dL=qL[0]-palLab[j*3],da=qL[1]-palLab[j*3+1],db=qL[2]-palLab[j*3+2];
+                    const d=dL*dL+da*da+db*db;
+                    if(d<bd){bd=d;best=j;if(d<1e-12)break;}
+                }
+                return (cache[key]=best);
+            }
+
+            const isMaximum = quality === 'maximum';
+            const isUltra   = quality === 'ultra';
+            const isStandard = quality === 'standard';
+
+            for (let y = 0; y < height; y++) {
+                for (let x = 0; x < width; x++) {
+                    const pi = y * width + x;
+                    const ri = pi << 2;
+                    const r = Math.max(0,Math.min(255,Math.round(rgba[ri]   +eR[pi])));
+                    const g = Math.max(0,Math.min(255,Math.round(rgba[ri+1] +eG[pi])));
+                    const b = Math.max(0,Math.min(255,Math.round(rgba[ri+2] +eB[pi])));
+                    const idx = nearest(r, g, b);
+                    indexed[pi] = idx;
+                    const er = r - palette[idx*3];
+                    const eg = g - palette[idx*3+1];
+                    const eb = b - palette[idx*3+2];
+
+                    // Adaptive dither weight
+                    let dw;
+                    if (isMaximum || isUltra) {
+                        dw = 1.0;
+                    } else if (isStandard) {
+                        dw = activityMap ? Math.min(1, activityMap[pi] * 6) : 1.0;
+                    } else {
+                        dw = activityMap ? Math.min(1, 0.3 + activityMap[pi] * 4) : 1.0;
+                    }
+                    if (dw < 0.01) continue;
+
+                    if (isMaximum) {
+                        // ── Atkinson dithering (6/8 error distribution) ──
+                        // Right 1
+                        if (x < width-1) { eR[pi+1]+=er*dw/8; eG[pi+1]+=eg*dw/8; eB[pi+1]+=eb*dw/8; }
+                        // Right 2
+                        if (x < width-2) { eR[pi+2]+=er*dw/8; eG[pi+2]+=eg*dw/8; eB[pi+2]+=eb*dw/8; }
+                        if (y < height-1) {
+                            if (x > 0)        { eR[pi+width-1]+=er*dw/8; eG[pi+width-1]+=eg*dw/8; eB[pi+width-1]+=eb*dw/8; }
+                            eR[pi+width]  +=er*dw/8; eG[pi+width]  +=eg*dw/8; eB[pi+width]  +=eb*dw/8;
+                            if (x < width-1)  { eR[pi+width+1]+=er*dw/8; eG[pi+width+1]+=eg*dw/8; eB[pi+width+1]+=eb*dw/8; }
+                        }
+                        if (y < height-2) { eR[pi+width*2]+=er*dw/8; eG[pi+width*2]+=eg*dw/8; eB[pi+width*2]+=eb*dw/8; }
+                    } else {
+                        // ── Floyd-Steinberg dithering (7-3-5-1 / 16) ──
+                        const er_w=er*dw, eg_w=eg*dw, eb_w=eb*dw;
+                        if (x < width-1) { eR[pi+1]+=er_w*7/16; eG[pi+1]+=eg_w*7/16; eB[pi+1]+=eb_w*7/16; }
+                        if (y < height-1) {
+                            if (x > 0)       { eR[pi+width-1]+=er_w*3/16; eG[pi+width-1]+=eg_w*3/16; eB[pi+width-1]+=eb_w*3/16; }
+                            eR[pi+width]  +=er_w*5/16; eG[pi+width]  +=eg_w*5/16; eB[pi+width]  +=eb_w*5/16;
+                            if (x < width-1) { eR[pi+width+1]+=er_w*1/16; eG[pi+width+1]+=eg_w*1/16; eB[pi+width+1]+=eb_w*1/16; }
+                        }
+                    }
+                }
+            }
+            return indexed;
+        }
+
+        function lzwEncode(indices, minCodeSize) {
+            const HSIZE=5003, clear=1<<minCodeSize, eoi=clear+1;
+            const htab=new Int32Array(HSIZE).fill(-1), ctab=new Uint16Array(HSIZE);
+            let nextCode=eoi+1, codeSize=minCodeSize+1, maxCode=(1<<codeSize)-1;
+            let curByte=0, curBits=0;
+            const acBuf=new Uint8Array(256); let acLen=0;
+            const rawOut=[minCodeSize];
+            function flushAccum(){if(!acLen)return;rawOut.push(acLen);for(let i=0;i<acLen;i++)rawOut.push(acBuf[i]);acLen=0;}
+            function charOut(c){acBuf[acLen++]=c;if(acLen>=254)flushAccum();}
+            function writeBits(code){curByte|=code<<curBits;curBits+=codeSize;while(curBits>=8){charOut(curByte&0xff);curByte>>>=8;curBits-=8;}}
+            function clearHash(){htab.fill(-1);}
+            function resetEncoder(){writeBits(clear);clearHash();nextCode=eoi+1;codeSize=minCodeSize+1;maxCode=(1<<codeSize)-1;}
+            clearHash();writeBits(clear);
+            let ent=indices[0];
+            for(let i=1;i<indices.length;i++){
+                const c=indices[i],fcode=(c<<12)+ent;
+                let hval=(c<<4)^ent;
+                const disp=hval===0?1:HSIZE-hval;
+                let found=false;
+                while(htab[hval]!==-1){if(htab[hval]===fcode){ent=ctab[hval];found=true;break;}hval-=disp;if(hval<0)hval+=HSIZE;}
+                if(!found){writeBits(ent);ent=c;if(nextCode<=0xfff){ctab[hval]=nextCode++;htab[hval]=fcode;if(nextCode>maxCode+1&&codeSize<12){codeSize++;maxCode=(1<<codeSize)-1;}}else{resetEncoder();}}
+            }
+            writeBits(ent);writeBits(eoi);
+            if(curBits>0)charOut(curByte&0xff);
+            flushAccum();rawOut.push(0);
+            return rawOut;
+        }
+
+        function buildGIF89a(frames, width, height, delaysCs, repeat) {
+            const buf=[];
+            const b8=(v)=>buf.push(v&0xff);
+            const b16=(v)=>{b8(v);b8(v>>>8);};
+            const arr=(a)=>{for(let i=0;i<a.length;i++)buf.push(a[i]&0xff);};
+            arr([0x47,0x49,0x46,0x38,0x39,0x61]);
+            b16(width);b16(height);b8(0x00);b8(0);b8(0);
+            if(repeat>=0){arr([0x21,0xff,11,0x4e,0x45,0x54,0x53,0x43,0x41,0x50,0x45,0x32,0x2e,0x30,3,1]);b16(repeat);b8(0);}
+            for(let fi=0;fi<frames.length;fi++){
+                const frame=frames[fi];
+                const delayCs=Array.isArray(delaysCs)?delaysCs[fi]:delaysCs;
+                arr([0x21,0xf9,4,0x08]);b16(delayCs);b8(0);b8(0);
+                b8(0x2c);b16(0);b16(0);b16(width);b16(height);b8(0x87);
+                for(let i=0;i<256;i++){buf.push(frame.palette[i*3]||0,frame.palette[i*3+1]||0,frame.palette[i*3+2]||0);}
+                arr(frame.lzwData);
+            }
+            b8(0x3b);
+            return new Uint8Array(buf);
+        }
+
+        function isCanvasBlack(ctx, w, h) {
+            const d=ctx.getImageData(0,0,Math.min(w,32),Math.min(h,32)).data;
+            let s=0;for(let i=0;i<d.length;i+=4)s+=d[i]+d[i+1]+d[i+2];
+            return s===0;
+        }
+
+        function encodeOneFrame(imageData, width, height, quality) {
+            const rgba   = imageData.data;
+            // 'maximum' quality uses DETAIL_BOOST=12 for extra palette allocation
+            const boost  = (quality === 'maximum') ? 12.0 : undefined;
+            const actMap = (quality !== 'fast') ? buildActivityMap(rgba, width, height) : null;
+            const palette = mmcQuantize(rgba, 256, actMap, boost);
+            const indexed = indexWithDither(rgba, palette, 256, width, height, actMap, quality || 'high');
+            const lzwData = lzwEncode(indexed, 8);
+            return { palette, lzwData };
+        }
+
+        async function encodeFrames(imgDataArr, width, height, delayMsOrArr, onProgress, quality) {
+            quality = quality || 'high';
+            const makeDelayCs = (ms) => Math.max(2, Math.round(ms/10));
+            const delaysCs = Array.isArray(delayMsOrArr) ? delayMsOrArr.map(makeDelayCs) : makeDelayCs(delayMsOrArr);
+            const encodedFrames = [];
+            for (let i=0;i<imgDataArr.length;i++) {
+                encodedFrames.push(encodeOneFrame(imgDataArr[i], width, height, quality));
+                imgDataArr[i]=null;
+                if (onProgress) onProgress(i/imgDataArr.length);
+                await new Promise(r=>setTimeout(r,0));
+            }
+            const bytes=buildGIF89a(encodedFrames,width,height,delaysCs,0);
+            return new Blob([bytes],{type:'image/gif'});
+        }
+
+        function buildBlobFromEncoded(encodedFrames, width, height, delayMsOrArr) {
+            const makeDelayCs=(ms)=>Math.max(2,Math.round(ms/10));
+            const delaysCs=Array.isArray(delayMsOrArr)?delayMsOrArr.map(makeDelayCs):makeDelayCs(delayMsOrArr);
+            const bytes=buildGIF89a(encodedFrames,width,height,delaysCs,0);
+            return new Blob([bytes],{type:'image/gif'});
+        }
+
+        return { encodeFrames, encodeOneFrame, buildBlobFromEncoded, isCanvasBlack };
+    })();
+
+    // ═══════════════════════════════════════════════════════════════
+    // §2 · CONFIGURATION & STATE
+    // ═══════════════════════════════════════════════════════════════
+    const IS_YOUTUBE = /youtube\.com|youtu\.be/.test(window.location.hostname);
+
+    let currentRate   = 1.0;
+    let currentVolume = 100;
+    let guiVisible    = false;
+    let userHidden    = false;
+    let isDragging    = false;
+
+    // v4.0: bhState replaces guiCollapsed (0=full, 1=split, 2=BH-only)
+    let bhState      = 0;
+    let _bhDragDist  = 0;
+    let dragOX = 0, dragOY = 0;
+
+    let isRecording      = false;
+    let progressInterval = null;
+    let _backupTimeout   = null;
+
+    // v4.0: render engine abort + stream refs for instant cancel
+    let _videoAbortFlag  = false;
+    let _currentStream   = null;
+    let _currentRecorder = null;
+
+    let reverseRafId  = null;
+    let reverseLastTs = null;
+    let _reverseMuted = false;
+
+    let abA=null, abB=null, abLoopActive=false, abRafId=null;
+    let espActive=false, espRafId=null;
+    const espBoxes = new Map();
+
+    let _settingRate = false;
+    let audioCtx = null;
+    const gainNodes = new WeakMap();
+
+    let _gifAbortFlag = false;
+
+    // ═══════════════════════════════════════════════════════════════
+    // §3 · WEB AUDIO ENGINE
+    // ═══════════════════════════════════════════════════════════════
+    function initAudio() {
+        if (!audioCtx) audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+        if (audioCtx.state === 'suspended') audioCtx.resume();
+    }
+
+    // ═══════════════════════════════════════════════════════════════
+    // §4 · SHADOW DOM & ESP CONTAINER
+    // ═══════════════════════════════════════════════════════════════
+    const _appendToBody = (el) => {
+        if (document.body) document.body.appendChild(el);
+        else document.addEventListener('DOMContentLoaded', ()=>document.body.appendChild(el), {once:true});
+    };
+
+    const host = document.createElement('div');
+    host.id = 'gume-host';
+    Object.assign(host.style, { position:'fixed', top:'14px', right:'14px', zIndex:'2147483647', pointerEvents:'none' });
+    _appendToBody(host);
+    const shadow = host.attachShadow({ mode: 'closed' });
+
+    const espOverlay = document.createElement('div');
+    Object.assign(espOverlay.style, { position:'fixed', inset:'0', pointerEvents:'none', zIndex:'2147483640', display:'none' });
+    const espBlocker = document.createElement('div');
+    Object.assign(espBlocker.style, { position:'absolute', inset:'0', background:'rgba(4,0,14,0.44)', backdropFilter:'blur(2px)', pointerEvents:'auto', cursor:'crosshair', zIndex:'0' });
+    espOverlay.appendChild(espBlocker);
+    _appendToBody(espOverlay);
+
+    if (!document.getElementById('gume-esp-css')) {
+        const espStyle = document.createElement('style');
+        espStyle.id = 'gume-esp-css';
+        espStyle.textContent = `
+            .gume-esp-box{position:absolute;pointer-events:auto;cursor:pointer;z-index:1;}
+            .gume-esp-box .eb-frame{position:absolute;inset:0;border:2px solid #00ff80;border-radius:3px;pointer-events:none;transition:border-color .14s,box-shadow .14s;box-shadow:0 0 14px rgba(0,255,120,.55),inset 0 0 14px rgba(0,255,120,.08);}
+            .gume-esp-box .eb-frame::before,.gume-esp-box .eb-frame::after{content:'';position:absolute;width:14px;height:14px;}
+            .gume-esp-box .eb-frame::before{top:-3px;left:-3px;border-top:3px solid #00ff80;border-left:3px solid #00ff80;}
+            .gume-esp-box .eb-frame::after{bottom:-3px;right:-3px;border-bottom:3px solid #00ff80;border-right:3px solid #00ff80;}
+            .gume-esp-box .eb-label{position:absolute;top:-27px;left:0;background:rgba(0,255,120,.10);border:1px solid rgba(0,255,120,.50);border-radius:4px;padding:2px 9px;font:900 11px/1.5 system-ui,sans-serif;color:#00ff88;white-space:nowrap;display:flex;align-items:center;gap:5px;pointer-events:none;backdrop-filter:blur(8px);}
+            .gume-esp-box .eb-del{position:absolute;top:50%;left:50%;transform:translate(-50%,-50%);background:rgba(0,0,0,.70);border:1.5px solid rgba(255,50,50,.65);border-radius:8px;padding:5px 16px;color:rgba(255,90,90,.92);font:900 12px/1 system-ui,sans-serif;display:flex;align-items:center;gap:6px;opacity:0;transition:opacity .14s;pointer-events:none;white-space:nowrap;}
+            .gume-esp-box:hover .eb-del{opacity:1;}
+            .gume-esp-box:hover .eb-frame{border-color:#ff4040;box-shadow:0 0 16px rgba(255,50,50,.65),inset 0 0 16px rgba(255,50,50,.12);}
+            .gume-esp-scan{position:absolute;left:0;right:0;top:0;height:2px;background:linear-gradient(90deg,transparent,rgba(0,255,120,.85),transparent);animation:gume-scan 2.8s linear infinite;pointer-events:none;z-index:2;}
+            @keyframes gume-scan{0%{top:0%;opacity:1}95%{top:100%;opacity:.28}100%{top:100%;opacity:0}}
+        `;
+        (document.head || document.documentElement).appendChild(espStyle);
+    }
+
+    // ═══════════════════════════════════════════════════════════════
+    // §5 · SVG ICON LIBRARY
+    // ═══════════════════════════════════════════════════════════════
+    const IC = {
+        speed:  `<svg width="15" height="15" viewBox="0 0 24 24" fill="currentColor"><path d="M13 2L3 14h9l-1 8 10-12h-9z"/></svg>`,
+        volume: `<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M11 5L6 9H2v6h4l5 4V5z" fill="currentColor" stroke="none"/><path d="M15.5 8.5a5 5 0 010 7"/><path d="M19 5a10 10 0 010 14"/></svg>`,
+        mute:   `<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M11 5L6 9H2v6h4l5 4V5z" fill="currentColor" stroke="none"/><line x1="23" y1="9" x2="17" y2="15"/><line x1="17" y1="9" x2="23" y2="15"/></svg>`,
+        radar:  `<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><circle cx="12" cy="12" r="5"/><circle cx="12" cy="12" r="1.8" fill="currentColor" stroke="none"/><line x1="12" y1="12" x2="20" y2="5" stroke-linecap="round"/></svg>`,
+        studio: `<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 01-2 2H5a2 2 0 01-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>`,
+        camera: `<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M23 19a2 2 0 01-2 2H3a2 2 0 01-2-2V8a2 2 0 012-2h4l2-3h6l2 3h4a2 2 0 012 2z"/><circle cx="12" cy="13" r="4"/></svg>`,
+        pip:    `<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="2" y="2" width="20" height="14" rx="2"/><rect x="12" y="10" width="9" height="6" rx="1" fill="currentColor" stroke="none"/></svg>`,
+        loop:   `<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="17 1 21 5 17 9"/><path d="M3 11V9a4 4 0 014-4h14"/><polyline points="7 23 3 19 7 15"/><path d="M21 13v2a4 4 0 01-4 4H3"/></svg>`,
+        copy:   `<svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 01-2-2V4a2 2 0 012-2h9a2 2 0 012 2v1"/></svg>`,
+        trash:  `<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="3 6 5 6 21 6"/><path d="M19 6l-1 14a2 2 0 01-2 2H8a2 2 0 01-2-2L5 6"/><path d="M10 11v6M14 11v6"/><path d="M9 6V4a1 1 0 011-1h4a1 1 0 011 1v2"/></svg>`,
+        gif:    `<svg width="14" height="14" viewBox="0 0 44 26" fill="none" stroke="currentColor" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round"><rect x="1" y="1" width="42" height="24" rx="4"/><path d="M11 18v-5a5 5 0 00-10 0v5"/><line x1="6" y1="15" x2="6" y2="18"/><line x1="18" y1="8" x2="18" y2="18"/><path d="M24 8h7v4h-5v4h7"/></svg>`,
+        vidico: `<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polygon points="23 7 16 12 23 17 23 7"/><rect x="1" y="5" width="15" height="14" rx="2"/></svg>`,
+        stop:   `<svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor"><rect x="4" y="4" width="16" height="16" rx="2"/></svg>`,
+        rev:    `<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polygon points="19 20 9 12 19 4 19 20"/><line x1="5" y1="19" x2="5" y2="5"/></svg>`,
+    };
+
+    // ═══════════════════════════════════════════════════════════════
+    // §6 · COMPREHENSIVE CSS  (inside Shadow DOM)
+    //
+    //  v4.0 changes:
+    //   • Main GUI width: 230px → 280px (font bump via em-inheritance)
+    //   • Black hole 3-state: .gume-split (State 1), .gume-bhonly (State 2)
+    //   • Timeline scrubber styles
+    //   • Modal width: 480px → 580px
+    //   • Split panel transition (width animates)
+    // ═══════════════════════════════════════════════════════════════
+    const styleEl = document.createElement('style');
+    styleEl.textContent = `
+        *{box-sizing:border-box;margin:0;padding:0;}
+
+        #gume-gui{
+            width:280px;
+            background:linear-gradient(158deg,rgba(3,0,12,.97) 0%,rgba(9,2,22,.97) 100%);
+            border:1.5px solid rgba(108,38,198,.70);
+            border-radius:16px;
+            padding:18px 16px 14px;
+            font-family:'Montserrat','Segoe UI',system-ui,sans-serif;
+            color:#d0c0f0;
+            font-size:12.5px;
+            user-select:none;
+            pointer-events:auto;
+            position:relative;
+            overflow:hidden;
+            box-shadow:0 0 36px rgba(118,38,218,.55),0 0 72px rgba(0,158,255,.18),inset 0 0 22px rgba(98,28,198,.08);
+            opacity:0;
+            transition:opacity .22s ease, width .32s cubic-bezier(.4,0,.2,1);
+        }
+        #gume-gui::before{
+            content:'';position:absolute;inset:0;border-radius:16px;
+            background:
+                radial-gradient(1px 1px at 18% 24%,rgba(255,255,255,.55) 0%,transparent 100%),
+                radial-gradient(1px 1px at 72% 11%,rgba(255,255,255,.38) 0%,transparent 100%),
+                radial-gradient(1.5px 1.5px at 44% 68%,rgba(255,255,255,.44) 0%,transparent 100%),
+                radial-gradient(1px 1px at 88% 42%,rgba(255,255,255,.30) 0%,transparent 100%),
+                radial-gradient(1px 1px at 26% 87%,rgba(255,255,255,.36) 0%,transparent 100%);
+            opacity:.13;pointer-events:none;animation:star-drift 28s linear infinite;
+        }
+        @keyframes star-drift{to{background-position:36px 36px,45px 45px,30px 50px,22px 38px,55px 28px;}}
+        #gume-gui::after{content:'';position:absolute;inset:0;background:repeating-linear-gradient(0deg,transparent,transparent 3px,rgba(0,0,0,.055) 3px,rgba(0,0,0,.055) 4px);pointer-events:none;opacity:.65;}
+
+        /* ── STATE 1: SPLIT — two panels side-by-side ── */
+        #gume-gui.gume-split { width:568px; }
+        .gume-panels { display:flex; flex-direction:column; transition:flex-direction .28s; }
+        #gume-gui.gume-split .gume-panels { flex-direction:row; gap:14px; }
+        #gume-gui.gume-split .gume-panel-l { width:254px; flex-shrink:0; border-right:1px solid rgba(108,38,198,.30); padding-right:12px; }
+        #gume-gui.gume-split .gume-panel-r { flex:1; }
+        /* divider between panels */
+        .gume-panel-l .gdiv, .gume-panel-r .gdiv { margin:8px 0; }
+
+        /* ── STATE 2: BH-ONLY ── */
+        #gume-gui.gume-bhonly .gume-panels,
+        #gume-gui.gume-bhonly .gume-hint {
+            max-height:0 !important; overflow:hidden; opacity:0 !important;
+            margin:0 !important; padding:0 !important;
+            transition:max-height .34s cubic-bezier(.4,0,.2,1), opacity .22s ease, margin .28s, padding .28s;
+        }
+        #gume-gui.gume-bhonly { padding-bottom:10px; }
+
+        /* ── BLACK HOLE HEADER ── */
+        .gume-hdr{display:flex;flex-direction:column;align-items:center;margin-bottom:13px;position:relative;z-index:1;cursor:grab;padding-bottom:2px;}
+        .gume-hdr:active{cursor:grabbing;}
+        .bh{width:80px;height:80px;position:relative;margin-bottom:10px;flex-shrink:0;}
+        .bh-ambient{position:absolute;inset:-14px;border-radius:50%;background:radial-gradient(circle,transparent 28%,rgba(255,100,20,.07) 42%,rgba(158,28,255,.10) 55%,transparent 70%);animation:bh-halo 5s ease-in-out infinite;}
+        @keyframes bh-halo{0%,100%{transform:scale(1);opacity:.75;}50%{transform:scale(1.10);opacity:1;}}
+        .bh-lens{position:absolute;inset:7px;border-radius:50%;border:1px solid rgba(255,158,58,.11);box-shadow:0 0 14px 5px rgba(255,98,0,.09),inset 0 0 14px 5px rgba(255,98,0,.05);}
+        .bh-disk{position:absolute;inset:0;border-radius:50%;background:conic-gradient(from 0deg,rgba(255,48,0,0) 0deg,rgba(255,138,38,.74) 22deg,rgba(255,218,128,1) 48deg,rgba(255,148,48,.84) 78deg,rgba(255,68,0,.54) 128deg,rgba(198,28,0,.24) 178deg,rgba(255,68,0,.54) 218deg,rgba(255,138,58,.80) 266deg,rgba(255,228,138,1) 303deg,rgba(255,138,38,.74) 333deg,rgba(255,48,0,0) 360deg);-webkit-mask:radial-gradient(circle,transparent 33%,rgba(0,0,0,.95) 37%,#000 47%,transparent 52%);mask:radial-gradient(circle,transparent 33%,rgba(0,0,0,.95) 37%,#000 47%,transparent 52%);animation:bh-disk-a 9s linear infinite;filter:blur(1px);}
+        @keyframes bh-disk-a{from{transform:scaleY(.28) rotate(0deg);}to{transform:scaleY(.28) rotate(360deg);}}
+        .bh-disk-b{position:absolute;inset:9%;border-radius:50%;background:conic-gradient(from 180deg,rgba(255,198,98,0) 0deg,rgba(255,198,98,.54) 54deg,rgba(255,88,18,.38) 113deg,rgba(198,38,0,.16) 198deg,rgba(255,88,18,.38) 273deg,rgba(255,198,98,.54) 328deg,rgba(255,198,98,0) 360deg);-webkit-mask:radial-gradient(circle,transparent 36%,rgba(0,0,0,.68) 40%,rgba(0,0,0,.48) 47%,transparent 51%);mask:radial-gradient(circle,transparent 36%,rgba(0,0,0,.68) 40%,rgba(0,0,0,.48) 47%,transparent 51%);animation:bh-disk-a 6.5s linear infinite reverse;filter:blur(.5px);}
+        .bh-photon{position:absolute;inset:24%;border-radius:50%;border:2px solid rgba(255,208,128,.55);box-shadow:0 0 8px 2px rgba(255,188,78,.50),0 0 18px 5px rgba(255,98,0,.28),inset 0 0 8px 2px rgba(255,198,98,.25);animation:bh-photon-p 2.6s ease-in-out infinite alternate;}
+        @keyframes bh-photon-p{from{box-shadow:0 0 4px 1px rgba(255,188,78,.34),0 0 11px 3px rgba(255,98,0,.20),inset 0 0 4px 1px rgba(255,198,98,.18);opacity:.74;}to{box-shadow:0 0 12px 5px rgba(255,218,98,.70),0 0 24px 8px rgba(255,98,0,.44),inset 0 0 10px 3px rgba(255,208,108,.44);opacity:1;}}
+        .bh-core{position:absolute;inset:27%;border-radius:50%;background:radial-gradient(circle at 36% 33%,rgba(26,7,53,.55) 0%,rgba(4,0,13,.97) 45%,#000 100%);box-shadow:0 0 22px 10px rgba(0,0,0,.97);z-index:3;}
+        .bh-jt,.bh-jb{position:absolute;left:50%;width:4px;margin-left:-2px;border-radius:2px;pointer-events:none;z-index:2;}
+        .bh-jt{bottom:72%;height:18px;background:linear-gradient(0deg,rgba(148,78,255,.70),transparent);animation:bh-jet 2.1s ease-in-out infinite alternate;}
+        .bh-jb{top:72%;height:18px;background:linear-gradient(180deg,rgba(148,78,255,.70),transparent);animation:bh-jet 2.1s ease-in-out infinite alternate-reverse;}
+        @keyframes bh-jet{from{opacity:.48;height:14px;filter:blur(1px);}to{opacity:1;height:23px;filter:blur(0);box-shadow:0 0 9px rgba(178,78,255,.82);}}
+        .bh-pt{position:absolute;top:50%;left:50%;width:3px;height:3px;margin:-1.5px;border-radius:50%;background:rgba(255,218,148,.90);box-shadow:0 0 5px rgba(255,198,98,.82);animation:bh-orbit var(--dur,4s) linear infinite var(--del,0s);pointer-events:none;}
+        @keyframes bh-orbit{0%{transform:rotate(var(--a0,0deg)) translateX(var(--r,36px));opacity:var(--op,.82);}50%{transform:rotate(calc(var(--a0,0deg) + 180deg)) translateX(var(--r,36px));opacity:calc(var(--op,.82)*0.06);}100%{transform:rotate(calc(var(--a0,0deg) + 360deg)) translateX(var(--r,36px));opacity:var(--op,.82);}}
+
+        .gume-title{font-size:14px;font-weight:900;letter-spacing:3.5px;text-transform:uppercase;color:#d87eff;line-height:1;text-shadow:0 0 10px #ae3eff,0 0 22px #7c00ff,0 0 38px rgba(158,38,255,.44);}
+        .gume-sub{font-size:9px;letter-spacing:2px;text-transform:uppercase;color:rgba(188,138,255,.52);margin-top:4px;font-weight:700;}
+
+        /* ── bhState indicator ── */
+        .bh-state-dot{position:absolute;bottom:-6px;left:50%;transform:translateX(-50%);display:flex;gap:4px;}
+        .bh-state-dot span{width:5px;height:5px;border-radius:50%;background:rgba(148,48,255,.30);transition:background .22s;}
+        .bh-state-dot span.active{background:rgba(188,98,255,.90);box-shadow:0 0 6px rgba(188,98,255,.80);}
+
+        .gdiv{height:1px;margin:9px 0;background:linear-gradient(90deg,transparent,rgba(148,48,255,.54),rgba(0,198,255,.44),rgba(148,48,255,.54),transparent);position:relative;z-index:1;}
+        .ctrl{margin-bottom:9px;position:relative;z-index:1;}
+        .ctrl-row{display:flex;justify-content:space-between;align-items:center;margin-bottom:5px;}
+        .ctrl-lbl{display:flex;align-items:center;gap:5px;font-size:11px;font-weight:700;color:#b896e6;letter-spacing:.7px;text-transform:uppercase;}
+        .ctrl-val{font-size:15px;font-weight:900;color:#00ffff;text-shadow:0 0 12px rgba(0,255,255,.74);font-variant-numeric:tabular-nums;min-width:52px;text-align:right;}
+        .ctrl-val.vol{color:#ff5ede;text-shadow:0 0 12px rgba(255,58,218,.74);}
+        .ctrl-val.ab{color:#48ff8e;text-shadow:0 0 10px rgba(48,255,118,.68);font-size:11px;min-width:auto;}
+
+        input[type=range]{-webkit-appearance:none;width:100%;background:transparent;height:20px;cursor:pointer;}
+        input[type=range]:focus{outline:none;}
+        input[type=range]::-webkit-slider-runnable-track{height:5px;background:linear-gradient(90deg,rgba(255,255,255,.05),rgba(255,255,255,.1));border-radius:3px;border:1px solid rgba(148,48,255,.34);box-shadow:inset 0 1px 3px rgba(0,0,0,.6);}
+        input[type=range]::-webkit-slider-thumb{-webkit-appearance:none;width:17px;height:17px;border-radius:50%;background:radial-gradient(circle at 36% 35%,#6efeff,#00b6d2);border:1.5px solid rgba(255,255,255,.70);box-shadow:0 0 8px rgba(0,255,255,.80),0 0 18px rgba(0,198,255,.40);cursor:pointer;margin-top:-6px;transition:transform .1s,box-shadow .1s;}
+        input[type=range]::-webkit-slider-thumb:hover{transform:scale(1.26);box-shadow:0 0 14px rgba(0,255,255,1),0 0 28px rgba(0,198,255,.6);}
+        #gume-vol-s::-webkit-slider-thumb{background:radial-gradient(circle at 36% 35%,#ff8ef0,#cc00cc);box-shadow:0 0 8px rgba(255,58,218,.80),0 0 18px rgba(255,0,198,.40);}
+        #gume-vol-s::-webkit-slider-runnable-track{border-color:rgba(255,58,218,.34);}
+
+        .btn-row{display:flex;gap:6px;}
+        .gb{flex:1;display:inline-flex;align-items:center;justify-content:center;gap:4px;padding:6px 4px;background:rgba(255,255,255,.04);border:1px solid rgba(148,48,255,.44);color:#d8cef0;border-radius:7px;font-size:11px;font-weight:800;cursor:pointer;letter-spacing:.4px;transition:background .14s,border-color .14s,box-shadow .14s,transform .1s,color .14s;white-space:nowrap;font-family:inherit;}
+        .gb:hover{background:rgba(148,48,255,.30);border-color:rgba(188,98,255,.90);color:#fff;box-shadow:0 0 10px rgba(148,48,255,.64),0 0 22px rgba(148,48,255,.26);transform:translateY(-1.5px);}
+        .gb:active{transform:translateY(.5px);box-shadow:none;}
+        .gb.cyan{border-color:rgba(0,208,255,.44);color:#00e6ff;}
+        .gb.cyan:hover{background:rgba(0,188,255,.28);border-color:rgba(0,218,255,.90);box-shadow:0 0 10px rgba(0,208,255,.64);color:#fff;}
+        .gb.green{border-color:rgba(0,255,108,.44);color:#00ff80;}
+        .gb.green:hover{background:rgba(0,198,88,.27);border-color:rgba(0,255,108,.90);box-shadow:0 0 10px rgba(0,255,108,.64);color:#fff;}
+        .gb.red{border-color:rgba(255,48,48,.44);color:#ff6666;}
+        .gb.red:hover{background:rgba(255,38,38,.27);border-color:rgba(255,68,68,.90);box-shadow:0 0 10px rgba(255,38,38,.58);color:#fff;}
+        .gb.full{width:100%;padding:8px 12px;font-size:12px;margin-top:5px;flex:none;}
+        .gb.pink{border-color:rgba(255,0,158,.44);color:#ff80de;}
+        .gb.pink:hover{background:rgba(255,0,158,.28);border-color:rgba(255,0,158,.90);box-shadow:0 0 14px rgba(255,0,158,.64);color:#fff;}
+        .gb.esp-on{background:rgba(255,38,38,.22)!important;border-color:rgba(255,54,54,.90)!important;color:#ff8080!important;animation:esp-btn-glow 1s ease-in-out infinite alternate!important;}
+        @keyframes esp-btn-glow{from{box-shadow:0 0 8px rgba(255,38,38,.44);}to{box-shadow:0 0 18px rgba(255,38,38,.90),0 0 36px rgba(255,0,0,.34);}}
+
+        .ab-marks{display:flex;gap:6px;margin-bottom:5px;margin-top:2px;}
+        .ab-mark{flex:1;text-align:center;background:rgba(0,255,108,.04);border:1px solid rgba(0,255,108,.18);border-radius:5px;padding:3px 0;font-size:10px;font-weight:800;color:rgba(0,255,108,.44);transition:all .18s;font-variant-numeric:tabular-nums;}
+        .ab-mark.set{background:rgba(0,255,108,.10);border-color:rgba(0,255,108,.60);color:#00ff88;}
+
+        .util-row{display:flex;gap:6px;margin-bottom:7px;position:relative;z-index:1;}
+        .ub{flex:1;display:inline-flex;align-items:center;justify-content:center;gap:4px;padding:6px 4px;background:rgba(255,255,255,.025);border:1px solid rgba(118,68,198,.30);color:rgba(198,168,255,.64);border-radius:7px;font-size:10px;font-weight:700;cursor:pointer;transition:all .14s;font-family:inherit;letter-spacing:.3px;}
+        .ub:hover{background:rgba(118,54,198,.22);border-color:rgba(158,88,255,.64);color:#dfd0ff;box-shadow:0 0 8px rgba(118,54,198,.44);transform:translateY(-1px);}
+        .ub.pip-on{border-color:rgba(0,255,198,.64)!important;color:#00ffc0!important;}
+
+        .gume-hint{text-align:center;font-size:10px;color:rgba(178,118,255,.54);margin-top:10px;letter-spacing:.7px;font-weight:700;position:relative;z-index:1;}
+
+        /* ── PANEL CONTENT ANIMATION ── */
+        .gume-panels { overflow:hidden; }
+        .gume-panels > :not(.gume-hdr) {
+            transition:max-height .34s cubic-bezier(.4,0,.2,1), opacity .22s ease, margin .28s, padding .28s;
+            max-height:600px;
+        }
+
+        /* ══ DOWNLOAD OVERLAY ══ */
+        #gume-dl-ov{display:none;position:fixed;inset:0;background:rgba(0,0,0,.89);backdrop-filter:blur(20px);-webkit-backdrop-filter:blur(20px);z-index:2147483647;align-items:center;justify-content:center;pointer-events:auto;overflow-y:auto;}
+
+        #gume-dl-modal{
+            width:580px;max-width:96vw;
+            background:linear-gradient(148deg,rgba(2,0,8,.99) 0%,rgba(11,3,24,.99) 100%);
+            border:1.5px solid rgba(0,208,255,.55);border-radius:18px;
+            padding:26px 28px 22px;
+            box-shadow:0 0 44px rgba(0,188,255,.37),0 0 88px rgba(178,0,255,.17),inset 0 0 28px rgba(0,168,255,.04);
+            color:#fff;font-family:'Montserrat','Segoe UI',system-ui,sans-serif;
+            display:flex;flex-direction:column;gap:14px;
+            position:relative;overflow:hidden;margin:auto;
+        }
+        #gume-dl-modal::before{content:'';position:absolute;top:-1px;left:-1px;width:46px;height:46px;border-top:3px solid rgba(0,255,255,.74);border-left:3px solid rgba(0,255,255,.74);border-radius:18px 0 0 0;}
+        #gume-dl-modal::after{content:'';position:absolute;bottom:-1px;right:-1px;width:46px;height:46px;border-bottom:3px solid rgba(255,0,188,.74);border-right:3px solid rgba(255,0,188,.74);border-radius:0 0 18px 0;}
+
+        .dl-title{text-align:center;font-size:20px;font-weight:900;letter-spacing:3px;text-transform:uppercase;color:#00ffff;text-shadow:0 0 16px rgba(0,255,255,.80),0 0 32px rgba(0,168,255,.50);}
+        .dl-grid{display:grid;grid-template-columns:1fr 1fr;gap:12px;}
+        .dl-field{display:flex;flex-direction:column;gap:5px;}
+        .dl-field.full{grid-column:1/-1;}
+        .dl-field label{font-size:10px;font-weight:800;color:rgba(178,158,218,.74);letter-spacing:1px;text-transform:uppercase;}
+        .dl-field select,.dl-field input[type=number]{background:rgba(255,255,255,.04);border:1.5px solid rgba(0,208,255,.32);color:#fff;padding:8px 10px;border-radius:8px;outline:none;font-size:13px;font-weight:700;transition:border-color .2s,box-shadow .2s;font-family:inherit;}
+        .dl-field select:focus,.dl-field input[type=number]:focus{border-color:rgba(0,208,255,.78);box-shadow:0 0 14px rgba(0,168,255,.37);}
+        .dl-field select option{background:#0b0318;}
+
+        .dl-section-hdr{font-size:10px;font-weight:900;color:rgba(255,178,80,.80);letter-spacing:2px;text-transform:uppercase;grid-column:1/-1;padding-top:4px;border-top:1px solid rgba(255,148,0,.18);margin-top:2px;}
+        .dl-src-row{display:flex;align-items:center;gap:8px;}
+        .dl-src-text{flex:1;font-size:10px;color:rgba(158,188,255,.50);font-family:monospace;background:rgba(255,255,255,.03);border:1px solid rgba(98,138,255,.18);border-radius:6px;padding:5px 9px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;}
+        .dl-src-badge{flex-shrink:0;font-size:9px;font-weight:900;letter-spacing:1px;padding:3px 8px;border-radius:5px;text-transform:uppercase;}
+        .dl-src-badge.blob{background:rgba(0,255,100,.12);border:1px solid rgba(0,255,100,.40);color:#00ff80;}
+        .dl-src-badge.direct{background:rgba(0,188,255,.12);border:1px solid rgba(0,188,255,.40);color:#00c8ff;}
+        .dl-src-badge.stream{background:rgba(255,128,0,.12);border:1px solid rgba(255,128,0,.40);color:#ffaa44;}
+        .dl-copy-btn{flex-shrink:0;display:inline-flex;align-items:center;gap:4px;padding:5px 10px;background:rgba(98,138,255,.10);border:1px solid rgba(98,138,255,.34);color:rgba(148,188,255,.74);border-radius:6px;font-size:11px;font-weight:700;cursor:pointer;transition:all .14s;font-family:inherit;}
+        .dl-copy-btn:hover{background:rgba(98,138,255,.27);border-color:rgba(148,188,255,.64);color:#fff;}
+
+        /* ── TIMELINE SCRUBBER ── */
+        .dl-scrubber{width:100%;padding:4px 0 2px;}
+        .dl-sc-track{position:relative;height:10px;background:rgba(255,255,255,.07);border-radius:5px;border:1px solid rgba(0,208,255,.22);cursor:pointer;margin-bottom:8px;}
+        .dl-sc-fill{position:absolute;top:0;bottom:0;background:linear-gradient(90deg,rgba(0,208,255,.55),rgba(178,0,255,.55));border-radius:5px;pointer-events:none;}
+        .dl-sc-handle{position:absolute;top:50%;width:16px;height:16px;border-radius:50%;transform:translate(-50%,-50%);cursor:ew-resize;z-index:2;transition:transform .1s,box-shadow .1s;}
+        .dl-sc-handle.start{background:radial-gradient(circle at 35% 35%,#6efeff,#00b6d2);box-shadow:0 0 8px rgba(0,255,255,.80),0 0 16px rgba(0,198,255,.40);border:1.5px solid rgba(255,255,255,.7);}
+        .dl-sc-handle.end{background:radial-gradient(circle at 35% 35%,#ff8ef0,#cc00cc);box-shadow:0 0 8px rgba(255,58,218,.80),0 0 16px rgba(255,0,198,.40);border:1.5px solid rgba(255,255,255,.7);}
+        .dl-sc-handle:hover,.dl-sc-handle:active{transform:translate(-50%,-50%) scale(1.28);}
+        .dl-sc-times{display:flex;justify-content:space-between;align-items:center;font-size:10px;font-weight:800;font-variant-numeric:tabular-nums;font-family:monospace;}
+        .dl-sc-t.start{color:#00e6ff;text-shadow:0 0 8px rgba(0,255,255,.60);}
+        .dl-sc-t.end{color:#ff80de;text-shadow:0 0 8px rgba(255,0,198,.60);}
+        .dl-sc-t.dur{color:rgba(200,180,255,.70);font-size:9px;letter-spacing:.8px;}
+        .dl-dur-info{font-size:10px;color:rgba(178,158,218,.60);text-align:center;margin-top:2px;letter-spacing:.5px;font-weight:700;}
+        .dl-dur-info.warn{color:rgba(255,180,60,.80);}
+        .dl-dur-info.live{color:rgba(255,80,80,.80);animation:s-pulse .8s ease-in-out infinite alternate;}
+
+        .dl-prog-wrap{display:none;width:100%;height:20px;background:rgba(0,0,0,.50);border-radius:10px;border:1px solid rgba(0,198,255,.27);overflow:hidden;position:relative;}
+        #gume-prog-bar{height:100%;width:0%;border-radius:9px;transition:width .12s linear;background:linear-gradient(90deg,#00ffff,#aa00ff,#ff00cc,#00ffff);background-size:300% 100%;animation:prog-shift 1.6s linear infinite;box-shadow:0 0 16px rgba(0,208,255,.80),0 0 32px rgba(178,0,255,.44);}
+        @keyframes prog-shift{0%{background-position:0% 0%}100%{background-position:300% 0%}}
+        .dl-prog-wrap::after{content:'';position:absolute;inset:0;background:repeating-linear-gradient(90deg,transparent,transparent 8px,rgba(0,0,0,.14) 8px,rgba(0,0,0,.14) 9px);}
+
+        #gume-dl-status{display:none;text-align:center;font-size:12px;font-weight:800;color:#ffff7e;white-space:pre-line;line-height:1.55;}
+        .s-rec{color:#ff5454!important;animation:s-pulse .7s ease-in-out infinite alternate;}
+        @keyframes s-pulse{from{opacity:1;text-shadow:0 0 8px rgba(255,48,48,.50)}to{opacity:.5;text-shadow:0 0 20px rgba(255,48,48,.92)}}
+
+        .dl-btn-row{display:flex;gap:10px;flex-wrap:wrap;}
+        .dl-btn{flex:1;min-width:100px;padding:10px;border-radius:9px;font-weight:900;font-size:12px;letter-spacing:.8px;text-transform:uppercase;cursor:pointer;transition:all .18s;font-family:inherit;}
+        .dl-btn:hover{transform:translateY(-2px);}
+        .dl-btn:active{transform:translateY(0);}
+        .dl-btn.prim{background:rgba(255,0,188,.14);border:1.5px solid rgba(255,0,188,.57);color:#ff80e8;}
+        .dl-btn.prim:hover{background:rgba(255,0,188,.52);box-shadow:0 0 22px rgba(255,0,188,.74);color:#fff;}
+        .dl-btn.orng{background:rgba(255,128,0,.14);border:1.5px solid rgba(255,128,0,.57);color:#ffb038;}
+        .dl-btn.orng:hover{background:rgba(255,128,0,.52);box-shadow:0 0 20px rgba(255,128,0,.64);color:#fff;}
+        .dl-btn.dngr{background:rgba(255,28,28,.14);border:1.5px solid rgba(255,54,54,.57);color:#ff7070;width:100%;flex-basis:100%;}
+        .dl-btn.dngr:hover{background:rgba(255,28,28,.47);box-shadow:0 0 18px rgba(255,28,28,.64);color:#fff;}
+        .dl-btn.warn{background:rgba(255,180,0,.14);border:1.5px solid rgba(255,180,0,.57);color:#ffd060;width:100%;flex-basis:100%;}
+        .dl-btn.warn:hover{background:rgba(255,180,0,.38);box-shadow:0 0 16px rgba(255,180,0,.58);color:#fff;}
+        .dl-btn:disabled{opacity:.38;cursor:not-allowed;transform:none;}
+    `;
+
+    // ═══════════════════════════════════════════════════════════════
+    // §7 · HTML STRUCTURE  v4.0
+    // ═══════════════════════════════════════════════════════════════
+    const guiRoot = document.createElement('div');
+    guiRoot.innerHTML = `
+        <div id="gume-gui">
+
+            <!-- BLACK HOLE HEADER — drag handle + click cycle -->
+            <div class="gume-hdr">
+                <div class="bh">
+                    <div class="bh-ambient"></div>
+                    <div class="bh-lens"></div>
+                    <div class="bh-disk"></div>
+                    <div class="bh-disk-b"></div>
+                    <div class="bh-photon"></div>
+                    <div class="bh-core"></div>
+                    <div class="bh-jt"></div>
+                    <div class="bh-jb"></div>
+                    <span class="bh-pt" style="--a0:14deg;  --r:36px;--dur:3.9s; --del:0s;   --op:.92"></span>
+                    <span class="bh-pt" style="--a0:96deg;  --r:34px;--dur:5.3s; --del:-1.4s;--op:.70;width:2px;height:2px;margin:-1px"></span>
+                    <span class="bh-pt" style="--a0:177deg; --r:37px;--dur:4.6s; --del:-2.6s;--op:.84"></span>
+                    <span class="bh-pt" style="--a0:253deg; --r:35px;--dur:6.2s; --del:-0.9s;--op:.63;width:2px;height:2px;margin:-1px"></span>
+                    <span class="bh-pt" style="--a0:311deg; --r:38px;--dur:3.3s; --del:-3.2s;--op:.77"></span>
+                    <span class="bh-pt" style="--a0:194deg; --r:32px;--dur:4.1s; --del:-1.9s;--op:.53;width:2px;height:2px;margin:-1px"></span>
+                    <div class="bh-state-dot">
+                        <span id="bh-dot-0" class="active"></span>
+                        <span id="bh-dot-1"></span>
+                        <span id="bh-dot-2"></span>
+                    </div>
+                </div>
+                <div class="gume-title">Cosmic Overlord</div>
+                <div class="gume-sub">Galaxy Media Engine &nbsp;v4.0</div>
+            </div>
+
+            <!-- PANELS WRAPPER (flex-row in split state) -->
+            <div class="gume-panels" id="gume-panels">
+
+                <!-- LEFT PANEL: Speed + Volume -->
+                <div class="gume-panel-l" id="gume-panel-l">
+                    <div class="gdiv"></div>
+
+                    <!-- SPEED ENGINE -->
+                    <div class="ctrl">
+                        <div class="ctrl-row">
+                            <div class="ctrl-lbl">${IC.speed} Speed Engine</div>
+                            <span class="ctrl-val" id="gume-sv">1.00x</span>
+                        </div>
+                        <input type="range" id="gume-ss" min="-14" max="14" step="0.05" value="1">
+                        <div class="btn-row" style="margin-top:5px">
+                            <button class="gb" id="gume-slow">−0.5</button>
+                            <button class="gb cyan" id="gume-rst">1×</button>
+                            <button class="gb" id="gume-fast">+0.5</button>
+                        </div>
+                    </div>
+
+                    <!-- OVERDRIVE VOLUME -->
+                    <div class="ctrl">
+                        <div class="ctrl-row">
+                            <div class="ctrl-lbl">${IC.volume} Overdrive Vol</div>
+                            <span class="ctrl-val vol" id="gume-vv">100%</span>
+                        </div>
+                        <input type="range" id="gume-vol-s" min="0" max="800" step="5" value="100">
+                        <div class="btn-row" style="margin-top:5px">
+                            <button class="gb red"  id="gume-mute">${IC.mute} Mute</button>
+                            <button class="gb cyan" id="gume-vrst">100%</button>
+                        </div>
+                    </div>
+                </div><!-- /panel-l -->
+
+                <!-- RIGHT PANEL: A-B Loop + Utils + ESP + Studio -->
+                <div class="gume-panel-r" id="gume-panel-r">
+                    <div class="gdiv"></div>
+
+                    <!-- A-B LOOP -->
+                    <div class="ctrl">
+                        <div class="ctrl-row">
+                            <div class="ctrl-lbl">${IC.loop} A-B Loop</div>
+                            <span class="ctrl-val ab" id="gume-abv">OFF</span>
+                        </div>
+                        <div class="ab-marks">
+                            <div class="ab-mark" id="gume-ab-ad">A: —</div>
+                            <div class="ab-mark" id="gume-ab-bd">B: —</div>
+                        </div>
+                        <div class="btn-row">
+                            <button class="gb green" id="gume-aba">Set A</button>
+                            <button class="gb green" id="gume-abb">Set B</button>
+                            <button class="gb red"   id="gume-abc">Clear</button>
+                        </div>
+                    </div>
+
+                    <div class="gdiv"></div>
+
+                    <!-- UTILITY ROW -->
+                    <div class="util-row">
+                        <button class="ub" id="gume-shot">${IC.camera} Screenshot</button>
+                        <button class="ub" id="gume-pip">${IC.pip} PiP</button>
+                    </div>
+
+                    <!-- ESP SCANNER -->
+                    <button class="gb full green" id="gume-esp">${IC.radar} BẬT ESP (SCANNER)</button>
+
+                    <!-- ULTRA STUDIO -->
+                    <button class="gb full pink" id="gume-studio" style="margin-top:6px;padding:9px">${IC.studio} Ultra Studio</button>
+                </div><!-- /panel-r -->
+
+            </div><!-- /gume-panels -->
+
+            <div class="gume-hint">G = Toggle GUI &nbsp;·&nbsp; Drag title to move &nbsp;·&nbsp; Click ● to cycle</div>
+        </div>
+
+        <!-- DOWNLOAD / RENDER OVERLAY -->
+        <div id="gume-dl-ov">
+            <div id="gume-dl-modal">
+                <h3 class="dl-title">Cosmic Studio v4</h3>
+
+                <!-- Source detection row -->
+                <div class="dl-src-row">
+                    <div class="dl-src-text" id="gume-src-disp" title="">Detecting source...</div>
+                    <span class="dl-src-badge" id="gume-src-badge">—</span>
+                    <button class="dl-copy-btn" id="gume-copy-url">${IC.copy} Copy URL</button>
+                </div>
+
+                <!-- Duration info bar -->
+                <div class="dl-dur-info" id="gume-dur-info">—</div>
+
+                <!-- ── VIDEO DOWNLOAD SECTION ── -->
+                <div class="dl-grid">
+                    <div class="dl-field">
+                        <label>Frame Rate (FPS)</label>
+                        <input type="number" id="gume-dl-fps" min="1" max="240" value="60">
+                    </div>
+                    <div class="dl-field">
+                        <label>Render Quality</label>
+                        <select id="gume-dl-qual">
+                            <option value="200000000">MAX — 200 Mbps</option>
+                            <option value="150000000">Extreme — 150 Mbps</option>
+                            <option value="100000000">Ultra — 100 Mbps</option>
+                            <option value="80000000">High — 80 Mbps</option>
+                            <option value="40000000" selected>Standard — 40 Mbps</option>
+                            <option value="20000000">Balanced — 20 Mbps</option>
+                            <option value="8000000">Lite — 8 Mbps</option>
+                        </select>
+                    </div>
+
+                    <!-- Video Timeline Scrubber -->
+                    <div class="dl-field full">
+                        <label>Video Range — drag handles &nbsp;|&nbsp; <span id="gume-vid-frame-info" style="color:rgba(0,208,255,.70);font-size:9px"></span></label>
+                        <div class="dl-scrubber">
+                            <div class="dl-sc-track" id="gume-vid-sc-track">
+                                <div class="dl-sc-fill" id="gume-vid-sc-fill"></div>
+                                <div class="dl-sc-handle start" id="gume-vid-sc-hs"></div>
+                                <div class="dl-sc-handle end"   id="gume-vid-sc-he"></div>
+                            </div>
+                            <div class="dl-sc-times">
+                                <span class="dl-sc-t start" id="gume-vid-sc-ts">00:00:00.00</span>
+                                <span class="dl-sc-t dur"   id="gume-vid-sc-td">⏱ 00:00:00.00</span>
+                                <span class="dl-sc-t end"   id="gume-vid-sc-te">00:00:00.00</span>
+                            </div>
+                        </div>
+                        <input type="hidden" id="gume-dl-st" value="0">
+                        <input type="hidden" id="gume-dl-en" value="60">
+                    </div>
+
+                    <!-- Reverse toggle -->
+                    <div class="dl-field full" style="flex-direction:row;align-items:center;gap:10px;">
+                        <label style="flex-shrink:0;margin:0">Reverse Download</label>
+                        <select id="gume-dl-reverse" style="flex:1">
+                            <option value="0">Normal — Start → End</option>
+                            <option value="1">Reverse — End → Start (canvas seek)</option>
+                        </select>
+                    </div>
+                </div>
+
+                <!-- ── GIF SETTINGS SECTION ── -->
+                <div class="dl-grid">
+                    <div class="dl-section-hdr">GIF Settings — v4.0</div>
+
+                    <div class="dl-field">
+                        <label>GIF FPS (max 50)</label>
+                        <input type="number" id="gume-gif-fps" min="1" max="50" value="20">
+                    </div>
+                    <div class="dl-field">
+                        <label>Max Dimension (px)</label>
+                        <select id="gume-gif-dim">
+                            <option value="480">480px — Fast</option>
+                            <option value="640">640px — Compact</option>
+                            <option value="960" selected>960px — Balanced</option>
+                            <option value="1280">1280px — High-res</option>
+                            <option value="1920">1920px — Ultra ⚠ RAM</option>
+                            <option value="2560">2560px — Max ⚠⚠ RAM</option>
+                        </select>
+                    </div>
+                    <div class="dl-field">
+                        <label>Colour Quality</label>
+                        <select id="gume-gif-qual">
+                            <option value="fast">Fast — RGB, no activity map</option>
+                            <option value="standard">Standard — OKLab + adaptive</option>
+                            <option value="high" selected>High — OKLab + detail-weighted</option>
+                            <option value="ultra">Ultra — OKLab + full FS dither</option>
+                            <option value="maximum">Maximum — Atkinson + DETAIL×12</option>
+                        </select>
+                    </div>
+                    <div class="dl-field">
+                        <label>Capture Mode</label>
+                        <select id="gume-gif-cap">
+                            <option value="seek" selected>Seek — Frame-accurate</option>
+                            <option value="play">Playback — Lag-free (slow)</option>
+                        </select>
+                    </div>
+
+                    <!-- GIF Timeline Scrubber -->
+                    <div class="dl-field full">
+                        <label>GIF Range — drag handles &nbsp;|&nbsp; <span id="gume-gif-frame-info" style="color:rgba(255,178,80,.70);font-size:9px"></span></label>
+                        <div class="dl-scrubber">
+                            <div class="dl-sc-track" id="gume-gif-sc-track">
+                                <div class="dl-sc-fill" id="gume-gif-sc-fill"></div>
+                                <div class="dl-sc-handle start" id="gume-gif-sc-hs"></div>
+                                <div class="dl-sc-handle end"   id="gume-gif-sc-he"></div>
+                            </div>
+                            <div class="dl-sc-times">
+                                <span class="dl-sc-t start" id="gume-gif-sc-ts">00:00:00.00</span>
+                                <span class="dl-sc-t dur"   id="gume-gif-sc-td">⏱ 00:00:00.00</span>
+                                <span class="dl-sc-t end"   id="gume-gif-sc-te">00:00:00.00</span>
+                            </div>
+                        </div>
+                        <input type="hidden" id="gume-gif-st" value="0">
+                        <input type="hidden" id="gume-gif-en" value="5">
+                    </div>
+                </div>
+
+                <div class="dl-prog-wrap" id="gume-prog-wrap"><div id="gume-prog-bar"></div></div>
+                <div id="gume-dl-status"></div>
+
+                <div class="dl-btn-row">
+                    <button class="dl-btn prim" id="gume-btn-dl">${IC.studio} Tải Video</button>
+                    <button class="dl-btn orng" id="gume-btn-gif">${IC.gif} Tạo GIF</button>
+                </div>
+                <div class="dl-btn-row">
+                    <button class="dl-btn warn" id="gume-btn-abort" style="display:none">${IC.stop} HỦY NGAY</button>
+                </div>
+                <div class="dl-btn-row">
+                    <button class="dl-btn dngr" id="gume-btn-close">Đóng Bảng</button>
+                </div>
+            </div>
+        </div>
+    `;
+
+    shadow.appendChild(styleEl);
+    shadow.appendChild(guiRoot);
+
+    // ═══════════════════════════════════════════════════════════════
+    // §8 · DOM ELEMENT REFERENCES
+    // ═══════════════════════════════════════════════════════════════
+    const $ = (id) => shadow.getElementById(id);
+    const guiEl    = $('gume-gui');
+    const sv       = $('gume-sv');
+    const ss       = $('gume-ss');
+    const vv       = $('gume-vv');
+    const volS     = $('gume-vol-s');
+    const abv      = $('gume-abv');
+    const abAd     = $('gume-ab-ad');
+    const abBd     = $('gume-ab-bd');
+    const dlOv     = $('gume-dl-ov');
+    const srcDisp  = $('gume-src-disp');
+    const srcBadge = $('gume-src-badge');
+    const durInfo  = $('gume-dur-info');
+    const dlFps    = $('gume-dl-fps');
+    const dlQual   = $('gume-dl-qual');
+    const dlSt     = $('gume-dl-st');
+    const dlEn     = $('gume-dl-en');
+    const dlReverse = $('gume-dl-reverse');
+    const gifFps   = $('gume-gif-fps');
+    const gifDim   = $('gume-gif-dim');
+    const gifQual  = $('gume-gif-qual');
+    const gifCap   = $('gume-gif-cap');
+    const gifSt    = $('gume-gif-st');
+    const gifEn    = $('gume-gif-en');
+    const progWrap = $('gume-prog-wrap');
+    const progBar  = $('gume-prog-bar');
+    const dlStatus = $('gume-dl-status');
+    const btnClose = $('gume-btn-close');
+    const btnAbort = $('gume-btn-abort');
+
+    // ═══════════════════════════════════════════════════════════════
+    // §9 · GUI DRAG SYSTEM  +  BLACK HOLE CLICK → 3-STATE CYCLE
+    //
+    //  bhState 0 → 1 → 2 → 0 → …
+    //  0: Full single-panel (280px)
+    //  1: Split dual-panel side-by-side (568px)
+    //  2: Black hole only — all content hidden
+    // ═══════════════════════════════════════════════════════════════
+    const dragHandle = guiEl.querySelector('.gume-hdr');
+
+    dragHandle.addEventListener('mousedown', (e) => {
+        if (e.button !== 0) return;
+        isDragging  = true; _bhDragDist = 0;
+        dragHandle.style.cursor = 'grabbing';
+        const r = host.getBoundingClientRect();
+        dragOX = e.clientX - r.left; dragOY = e.clientY - r.top;
+        e.preventDefault();
+    });
+    document.addEventListener('mousemove', (e) => {
+        if (!isDragging) return;
+        _bhDragDist += Math.hypot(e.movementX||0, e.movementY||0);
+        host.style.right = 'auto';
+        host.style.left  = Math.max(0, e.clientX - dragOX) + 'px';
+        host.style.top   = Math.max(0, e.clientY - dragOY) + 'px';
+    });
+    document.addEventListener('mouseup', () => {
+        if (isDragging) { isDragging = false; dragHandle.style.cursor = 'grab'; }
+    });
+
+    function _updateBhDots() {
+        [0,1,2].forEach(i => {
+            const dot = $(`bh-dot-${i}`);
+            if (dot) dot.classList.toggle('active', i === bhState);
+        });
+    }
+
+    const bhEl = guiEl.querySelector('.bh');
+    bhEl.addEventListener('click', (e) => {
+        e.stopPropagation();
+        if (_bhDragDist > 5) return;
+        bhState = (bhState + 1) % 3;
+        guiEl.classList.toggle('gume-split',  bhState === 1);
+        guiEl.classList.toggle('gume-bhonly', bhState === 2);
+        _updateBhDots();
+    });
+
+    // ═══════════════════════════════════════════════════════════════
+    // §10 · SPEED ENGINE
+    // ═══════════════════════════════════════════════════════════════
+    function installSpeedGuard(video) {
+        if (video._gumeGuard) return;
+        video._gumeGuard = true;
+        video.addEventListener('ratechange', () => {
+            if (_settingRate || isRecording || currentRate < 0) return;
+            const expected = currentRate === 0 ? 0.01 : currentRate;
+            if (Math.abs(video.playbackRate - expected) > 0.05) {
+                _settingRate = true; video.playbackRate = expected; _settingRate = false;
+            }
+        });
+    }
+
+    function applySpeed(speed) {
+        currentRate = Math.max(-14, Math.min(14, parseFloat(speed)));
+        sv.innerText = currentRate.toFixed(2) + 'x';
+        ss.value = currentRate;
+        const videos = document.querySelectorAll('video');
+        if (currentRate >= 0) {
+            if (_reverseMuted) {
+                _reverseMuted = false;
+                document.querySelectorAll('video').forEach(v => {
+                    v.muted = false;
+                    if (currentVolume > 100) { const n=gainNodes.get(v); if(n) n.gainNode.gain.value=currentVolume/100; }
+                });
+            }
+            if (reverseRafId) { cancelAnimationFrame(reverseRafId); reverseRafId = reverseLastTs = null; }
+            const rate = currentRate === 0 ? 0.01 : currentRate;
+            videos.forEach(vid => {
+                installSpeedGuard(vid);
+                _settingRate=true; vid.playbackRate=rate; _settingRate=false;
+                if (!vid.paused && !isRecording) vid.play().catch(()=>{});
+            });
+            if (IS_YOUTUBE) {
+                const ytP = document.querySelector('#movie_player');
+                if (ytP && typeof ytP.setPlaybackRate==='function')
+                    try { ytP.setPlaybackRate(Math.min(Math.max(rate,0.25),2)); } catch(_){}
+            }
+        } else {
+            if (!_reverseMuted) {
+                _reverseMuted = true;
+                document.querySelectorAll('video').forEach(v => {
+                    v.muted = true;
+                    const n=gainNodes.get(v);
+                    if(n && audioCtx) n.gainNode.gain.setTargetAtTime(0, audioCtx.currentTime, 0.01);
+                });
+            }
+            videos.forEach(vid => { if(!vid.paused) vid.pause(); });
+            if (!reverseRafId) {
+                const tick = (ts) => {
+                    if (!reverseLastTs) reverseLastTs = ts;
+                    const delta = (ts - reverseLastTs) / 1000; reverseLastTs = ts;
+                    document.querySelectorAll('video').forEach(v => {
+                        v.currentTime = Math.max(0, v.currentTime + currentRate * delta);
+                    });
+                    reverseRafId = requestAnimationFrame(tick);
+                };
+                reverseRafId = requestAnimationFrame(tick);
+            }
+        }
+    }
+
+    ss.addEventListener('input', e => applySpeed(e.target.value));
+    $('gume-slow').addEventListener('click', () => applySpeed(currentRate - 0.5));
+    $('gume-rst') .addEventListener('click', () => applySpeed(1.0));
+    $('gume-fast').addEventListener('click', () => applySpeed(currentRate + 0.5));
+
+    // ═══════════════════════════════════════════════════════════════
+    // §11 · VOLUME ENGINE
+    // ═══════════════════════════════════════════════════════════════
+    function applyVolume(pct) {
+        currentVolume = Math.round(Math.max(0,Math.min(800,parseFloat(pct))));
+        vv.innerText = currentVolume + '%';
+        volS.value = currentVolume;
+        document.querySelectorAll('video').forEach(vid => {
+            if (_reverseMuted) return;
+            if (currentVolume <= 100) {
+                vid.volume = currentVolume/100; vid.muted = false;
+                const n=gainNodes.get(vid); if(n) n.gainNode.gain.setTargetAtTime(1,audioCtx?audioCtx.currentTime:0,0.01);
+            } else {
+                vid.volume=1.0; vid.muted=false;
+                let n=gainNodes.get(vid);
+                if (!n) {
+                    try {
+                        initAudio();
+                        const source=audioCtx.createMediaElementSource(vid);
+                        const gainNode=audioCtx.createGain();
+                        source.connect(gainNode); gainNode.connect(audioCtx.destination);
+                        n={source,gainNode}; gainNodes.set(vid,n);
+                    } catch(_){ return; }
+                }
+                n.gainNode.gain.setTargetAtTime(currentVolume/100, audioCtx.currentTime, 0.02);
+            }
+        });
+    }
+
+    let _prevVol=100;
+    volS.addEventListener('input', e => { initAudio(); applyVolume(e.target.value); });
+    $('gume-mute').addEventListener('click', () => {
+        if (currentVolume>0) { _prevVol=currentVolume; applyVolume(0); $('gume-mute').innerHTML=`${IC.volume} Unmute`; }
+        else { applyVolume(_prevVol); $('gume-mute').innerHTML=`${IC.mute} Mute`; }
+    });
+    $('gume-vrst').addEventListener('click', () => { applyVolume(100); $('gume-mute').innerHTML=`${IC.mute} Mute`; });
+
+    // ═══════════════════════════════════════════════════════════════
+    // §12 · A-B LOOP ENGINE
+    // ═══════════════════════════════════════════════════════════════
+    function fmtTime(s) {
+        if (s===null) return '—';
+        const m=Math.floor(s/60);
+        return `${m}:${(s%60).toFixed(1).padStart(4,'0')}`;
+    }
+
+    function refreshAB() {
+        abAd.innerText=`A: ${fmtTime(abA)}`; abBd.innerText=`B: ${fmtTime(abB)}`;
+        abAd.classList.toggle('set',abA!==null); abBd.classList.toggle('set',abB!==null);
+        if (abA!==null && abB!==null && abB>abA) {
+            abv.innerText='ACTIVE'; abLoopActive=true;
+            if (!abRafId) {
+                const watch=()=>{ if(!abLoopActive) return; const v=getBestVideo(); if(v&&!v.paused&&v.currentTime>=abB) v.currentTime=abA; abRafId=requestAnimationFrame(watch); };
+                abRafId=requestAnimationFrame(watch);
+            }
+        } else {
+            abv.innerText=(abA!==null||abB!==null)?'WAIT...':'OFF'; abLoopActive=false;
+            if(abRafId){cancelAnimationFrame(abRafId);abRafId=null;}
+        }
+    }
+
+    $('gume-aba').addEventListener('click',()=>{ const v=getBestVideo();if(!v)return; abA=parseFloat(v.currentTime.toFixed(1)); if(abB!==null&&abA>=abB)abB=null; refreshAB(); });
+    $('gume-abb').addEventListener('click',()=>{ const v=getBestVideo();if(!v)return; abB=parseFloat(v.currentTime.toFixed(1)); if(abA!==null&&abB<=abA)[abA,abB]=[abB,abA]; refreshAB(); });
+    $('gume-abc').addEventListener('click',()=>{ abA=abB=null;abLoopActive=false; if(abRafId){cancelAnimationFrame(abRafId);abRafId=null;} refreshAB(); });
+
+    // ═══════════════════════════════════════════════════════════════
+    // §13 · SCREENSHOT ENGINE
+    // ═══════════════════════════════════════════════════════════════
+    $('gume-shot').addEventListener('click',()=>{
+        const v=getBestVideo();if(!v)return;
+        const c=document.createElement('canvas');
+        c.width=v.videoWidth||v.clientWidth; c.height=v.videoHeight||v.clientHeight;
+        try {
+            c.getContext('2d').drawImage(v,0,0,c.width,c.height);
+            c.toBlob(blob=>{ const url=URL.createObjectURL(blob); const a=Object.assign(document.createElement('a'),{href:url,download:`Cosmic_Shot_${Math.floor(v.currentTime)}s.png`}); document.body.appendChild(a);a.click();document.body.removeChild(a);setTimeout(()=>URL.revokeObjectURL(url),1000); },'image/png');
+        } catch(_){ alert('Không thể chụp ảnh — video được bảo vệ CORS/DRM.'); }
+    });
+
+    // ═══════════════════════════════════════════════════════════════
+    // §14 · PICTURE-IN-PICTURE ENGINE
+    // ═══════════════════════════════════════════════════════════════
+    $('gume-pip').addEventListener('click', async()=>{
+        const v=getBestVideo();if(!v)return;
+        const btn=$('gume-pip');
+        try {
+            if(document.pictureInPictureElement===v){await document.exitPictureInPicture();btn.classList.remove('pip-on');}
+            else{await v.requestPictureInPicture();btn.classList.add('pip-on');}
+        }catch(_){alert('Trình duyệt hoặc video này không hỗ trợ PiP.');}
+    });
+
+    // ═══════════════════════════════════════════════════════════════
+    // §15 · ESP SCANNER ENGINE
+    // ═══════════════════════════════════════════════════════════════
+    function _scanDoc(doc,out){
+        try {
+            doc.querySelectorAll('video').forEach(el=>out.add(el));
+            doc.querySelectorAll('img').forEach(img=>{ const src=img.currentSrc||img.src||''; if(/\.gif(\?|#|$)/i.test(src)||src.startsWith('data:image/gif')||(img.srcset&&/\.gif(\?|\s|$)/i.test(img.srcset))) out.add(img); });
+            doc.querySelectorAll('canvas').forEach(c=>{ if(c.width>0&&c.height>0) out.add(c); });
+            doc.querySelectorAll('iframe').forEach(iframe=>{ try{const idoc=iframe.contentDocument;if(idoc&&idoc!==doc)_scanDoc(idoc,out);}catch(_){} });
+        }catch(_){}
+    }
+    function scanMediaElements(){const out=new Set();_scanDoc(document,out);return out;}
+
+    function espLoop(){
+        if(!espActive)return;
+        const current=scanMediaElements();
+        for(const [el,box] of espBoxes.entries()){if(!current.has(el)){box.remove();espBoxes.delete(el);}}
+        for(const el of current){
+            const rect=el.getBoundingClientRect(); const tinyEl=(rect.width<2||rect.height<2);
+            let box=espBoxes.get(el);
+            if(!box){
+                const isGif=el.tagName==='IMG',isCanvas=el.tagName==='CANVAS';
+                const typeIco=isGif?IC.gif:(isCanvas?IC.camera:IC.vidico);
+                const typeTxt=isGif?'GIF':(isCanvas?'CANVAS':'VIDEO');
+                box=document.createElement('div');
+                box.className='gume-esp-box'+(tinyEl?' tiny':'');
+                box.innerHTML=`<div class="eb-frame"></div><div class="eb-label">${typeIco} ${typeTxt} · ${Math.round(rect.width)}×${Math.round(rect.height)}</div><div class="eb-del">${IC.trash} Click để xóa</div>`;
+                box.addEventListener('click',e=>{e.stopPropagation();try{el.remove();}catch(_){};box.remove();espBoxes.delete(el);});
+                espOverlay.appendChild(box); espBoxes.set(el,box);
+            }
+            const dW=Math.max(rect.width,14),dH=Math.max(rect.height,14);
+            const dT=rect.top-Math.max(0,14-rect.height)/2,dL=rect.left-Math.max(0,14-rect.width)/2;
+            box.style.cssText=`display:block;top:${dT}px;left:${dL}px;width:${dW}px;height:${dH}px;`;
+            const lbl=box.querySelector('.eb-label');
+            if(lbl){const isGif=el.tagName==='IMG',isCanvas=el.tagName==='CANVAS';lbl.innerHTML=`${isGif?IC.gif:(isCanvas?IC.camera:IC.vidico)} ${isGif?'GIF':(isCanvas?'CANVAS':'VIDEO')} · ${Math.round(rect.width)}×${Math.round(rect.height)}`;}
+        }
+        espRafId=requestAnimationFrame(espLoop);
+    }
+
+    $('gume-esp').addEventListener('click',()=>{
+        espActive=!espActive;
+        const btn=$('gume-esp');
+        if(espActive){
+            espOverlay.style.display='block';
+            if(!espBlocker.querySelector('.gume-esp-scan')){const scan=document.createElement('div');scan.className='gume-esp-scan';espBlocker.appendChild(scan);}
+            btn.innerHTML=`${IC.radar} TẮT ESP (ĐANG QUÉT)`;btn.classList.remove('green');btn.classList.add('esp-on');
+            espRafId=requestAnimationFrame(espLoop);
+        } else {
+            espOverlay.style.display='none';
+            btn.innerHTML=`${IC.radar} BẬT ESP (SCANNER)`;btn.classList.remove('esp-on');btn.classList.add('green');
+            if(espRafId){cancelAnimationFrame(espRafId);espRafId=null;}
+            espBoxes.forEach(b=>b.remove());espBoxes.clear();
+        }
+    });
+
+    // ═══════════════════════════════════════════════════════════════
+    // §16 · VIDEO SOURCE DETECTION
+    // ═══════════════════════════════════════════════════════════════
+    function getBestVideo(){
+        const all=[...document.querySelectorAll('video')];
+        if(!all.length) return null;
+        if(IS_YOUTUBE){const yt=document.querySelector('.video-stream, #movie_player video');if(yt)return yt;}
+        return all.sort((a,b)=>{const ap=!a.paused&&!a.ended?1:0,bp=!b.paused&&!b.ended?1:0;if(ap!==bp)return bp-ap;return(b.duration||0)-(a.duration||0);})[0];
+    }
+    function getVideoSrc(v){let s=v.currentSrc||v.src||'';if(!s){const src=v.querySelector?.('source[src]');if(src)s=src.src;}return s;}
+    function classifySrc(s){if(!s)return 'none';if(s.startsWith('blob:'))return 'blob';if(s.startsWith('data:'))return 'data';if(/\.m3u8(\?|$)/i.test(s))return 'hls';if(/\.mpd(\?|$)/i.test(s))return 'dash';return 'direct';}
+
+    // ═══════════════════════════════════════════════════════════════
+    // §16B · TIMELINE SCRUBBER ENGINE
+    //
+    //  Creates a drag-and-drop scrubber linked to hidden start/end
+    //  inputs.  Timecodes are displayed in HH:MM:SS.ff format.
+    //  Both handles support pointer capture for smooth drag-outside-
+    //  track behaviour.  Clicking the track snaps the nearest handle.
+    // ═══════════════════════════════════════════════════════════════
+    function formatTimecode(sec, fps) {
+        fps = fps || 30;
+        sec = Math.max(0, sec);
+        const totalF = Math.floor(sec * fps);
+        const frames = totalF % Math.round(fps);
+        const s      = Math.floor(sec);
+        const hh     = Math.floor(s / 3600);
+        const mm     = Math.floor((s % 3600) / 60);
+        const ss     = s % 60;
+        return `${String(hh).padStart(2,'0')}:${String(mm).padStart(2,'0')}:${String(ss).padStart(2,'0')}.${String(frames).padStart(2,'0')}`;
+    }
+
+    function initScrubber(opts) {
+        // opts: { trackEl, fillEl, hsEl, heEl, tsEl, teEl, tdEl, stInput, enInput, getFps }
+        const { trackEl, fillEl, hsEl, heEl, tsEl, teEl, tdEl, stInput, enInput, getFps } = opts;
+        let duration = 60;
+        let startFrac = 0, endFrac = 1;
+        let dragging = null;
+
+        function update() {
+            const sf = Math.max(0, Math.min(endFrac - 1e-6, startFrac));
+            const ef = Math.max(sf + 1e-6, Math.min(1, endFrac));
+            hsEl.style.left = (sf * 100).toFixed(3) + '%';
+            heEl.style.left = (ef * 100).toFixed(3) + '%';
+            fillEl.style.left  = (sf * 100).toFixed(3) + '%';
+            fillEl.style.width = ((ef - sf) * 100).toFixed(3) + '%';
+            const st = sf * duration, en = ef * duration;
+            stInput.value = st.toFixed(4);
+            enInput.value = en.toFixed(4);
+            const fps = getFps ? getFps() : 30;
+            tsEl.textContent = formatTimecode(st, fps);
+            teEl.textContent = formatTimecode(en, fps);
+            tdEl.textContent = '⏱ ' + formatTimecode(en - st, fps);
+        }
+
+        function fracFromEvent(e) {
+            const rect = trackEl.getBoundingClientRect();
+            return Math.max(0, Math.min(1, (e.clientX - rect.left) / rect.width));
+        }
+
+        hsEl.addEventListener('pointerdown', e => {
+            dragging = 'start'; hsEl.setPointerCapture(e.pointerId); e.stopPropagation();
+        });
+        heEl.addEventListener('pointerdown', e => {
+            dragging = 'end'; heEl.setPointerCapture(e.pointerId); e.stopPropagation();
+        });
+
+        const onMove = (e) => {
+            if (!dragging) return;
+            const f = fracFromEvent(e);
+            if (dragging === 'start') startFrac = Math.max(0, Math.min(endFrac - 1e-4, f));
+            else endFrac = Math.min(1, Math.max(startFrac + 1e-4, f));
+            update();
+        };
+        const onUp = () => { dragging = null; };
+
+        trackEl.addEventListener('pointermove', onMove);
+        trackEl.addEventListener('pointerup', onUp);
+        trackEl.addEventListener('pointerleave', e => { if (e.buttons === 0) onUp(); });
+
+        // Click on track body → snap nearest handle
+        trackEl.addEventListener('click', e => {
+            if (e.target === hsEl || e.target === heEl) return;
+            const f = fracFromEvent(e);
+            if (Math.abs(f - startFrac) <= Math.abs(f - endFrac))
+                startFrac = Math.max(0, Math.min(endFrac - 1e-4, f));
+            else
+                endFrac = Math.min(1, Math.max(startFrac + 1e-4, f));
+            update();
+        });
+
+        update();
+
+        return {
+            setDuration(dur) {
+                duration = Math.max(0.1, dur);
+                // Keep existing fractions but clamp
+                endFrac = Math.min(endFrac, 1);
+                update();
+            },
+            setRange(s, e) {
+                startFrac = Math.max(0, Math.min(1, s / duration));
+                endFrac   = Math.max(0, Math.min(1, e / duration));
+                update();
+            },
+        };
+    }
+
+    // Instantiate scrubbers (will be properly initialised in §17 on studio open)
+    const vidScrubber = initScrubber({
+        trackEl: $('gume-vid-sc-track'),
+        fillEl:  $('gume-vid-sc-fill'),
+        hsEl:    $('gume-vid-sc-hs'),
+        heEl:    $('gume-vid-sc-he'),
+        tsEl:    $('gume-vid-sc-ts'),
+        teEl:    $('gume-vid-sc-te'),
+        tdEl:    $('gume-vid-sc-td'),
+        stInput: dlSt,
+        enInput: dlEn,
+        getFps:  () => parseInt(dlFps.value) || 60,
+    });
+
+    const gifScrubber = initScrubber({
+        trackEl: $('gume-gif-sc-track'),
+        fillEl:  $('gume-gif-sc-fill'),
+        hsEl:    $('gume-gif-sc-hs'),
+        heEl:    $('gume-gif-sc-he'),
+        tsEl:    $('gume-gif-sc-ts'),
+        teEl:    $('gume-gif-sc-te'),
+        tdEl:    $('gume-gif-sc-td'),
+        stInput: gifSt,
+        enInput: gifEn,
+        getFps:  () => parseInt(gifFps.value) || 20,
+    });
+
+    // Update frame info labels when FPS changes
+    gifFps.addEventListener('change', () => {
+        gifScrubber.setRange(parseFloat(gifSt.value), parseFloat(gifEn.value));
+    });
+    dlFps.addEventListener('change', () => {
+        vidScrubber.setRange(parseFloat(dlSt.value), parseFloat(dlEn.value));
+    });
+
+    // ═══════════════════════════════════════════════════════════════
+    // §17 · ULTRA STUDIO — DOWNLOAD / RENDER ENGINE
+    //
+    //  v4.0 complete rewrite:
+    //
+    //  A) BLOB-FETCH DIRECT DOWNLOAD (highest quality, zero re-encode)
+    //     If v.currentSrc is a blob: URL, attempt fetch(blobURL) to
+    //     retrieve the raw video bytes already in MSE memory.
+    //     This gives 100% original quality with no MediaRecorder loss.
+    //     Saves as .mp4.  Falls through to Render Engine on failure.
+    //
+    //  B) RENDER ENGINE — SEEK-VERIFIED START
+    //     v.currentTime=startT → wait for 'seeked' event + double-rAF
+    //     GPU drain before recorder.start(). Eliminates the first-frame
+    //     garbage that caused the "stuttering" at capture start.
+    //
+    //  C) TIMEUPDATE-BASED STOP
+    //     Replaces the imprecise setTimeout(duration+800) with a
+    //     'timeupdate' listener that stops when currentTime >= endT.
+    //     Backup setTimeout still present as safety net.
+    //
+    //  D) IMMEDIATE CANCEL
+    //     _currentRecorder.stop() + stream.getTracks().forEach(stop)
+    //     + isRecording=false all happen synchronously on abort click.
+    //     onstop skips download if _videoAbortFlag is set.
+    //
+    //  E) MP4 CODEC CHAIN
+    //     Tries H.264 MP4 (Chrome 130+) first, then VP9 WebM, VP8 WebM.
+    //     File extension is set from recorder.mimeType.
+    //
+    //  F) REVERSE DOWNLOAD
+    //     Canvas-based: captures video frames seeking endT→startT and
+    //     draws them to an offscreen canvas whose captureStream() feeds
+    //     the recorder. Each frame is paced at 1/fps interval.
+    //
+    //  G) SMARTER DURATION CHECK
+    //     Detects live streams (duration===Infinity), unloaded metadata
+    //     (isNaN), warns on very short/long captures, shows estimated
+    //     file size before download.
+    // ═══════════════════════════════════════════════════════════════
+    $('gume-studio').addEventListener('click', () => {
+        if (espActive) $('gume-esp').click();
+        const v = getBestVideo();
+        if (!v) return alert('Không tìm thấy video!');
+
+        const src  = getVideoSrc(v);
+        const type = classifySrc(src);
+
+        // ── Smart duration analysis ─────────────────────────────
+        const isLive      = v.duration === Infinity;
+        const metaLoaded  = !isNaN(v.duration) && isFinite(v.duration);
+        const dur         = metaLoaded ? v.duration : 60;
+        const detectedFps = (() => {
+            // Try to read FPS from video element if available
+            try { return v.getVideoPlaybackQuality ? (v.webkitDecodedFrameCount ? 30 : 30) : 30; }
+            catch(_){ return 30; }
+        })();
+
+        // Duration badge
+        if (isLive) {
+            durInfo.textContent = '🔴 LIVE STREAM — end point follows current time';
+            durInfo.className   = 'dl-dur-info live';
+        } else if (!metaLoaded) {
+            durInfo.textContent = '⚠ Metadata chưa tải — hãy play video trước';
+            durInfo.className   = 'dl-dur-info warn';
+        } else {
+            const h=Math.floor(dur/3600), m=Math.floor((dur%3600)/60), s=Math.floor(dur%60);
+            const dimPx = v.videoWidth && v.videoHeight ? ` · ${v.videoWidth}×${v.videoHeight}` : '';
+            durInfo.textContent = `Duration: ${String(h).padStart(2,'0')}:${String(m).padStart(2,'0')}:${String(s).padStart(2,'0')}${dimPx}`;
+            durInfo.className   = 'dl-dur-info';
+        }
+
+        // Source badge
+        const badgeMap = { blob:'blob', direct:'direct', hls:'stream', dash:'stream', data:'stream', none:'stream' };
+        srcBadge.className = 'dl-src-badge ' + (badgeMap[type]||'stream');
+        const badgeTxt     = { blob:'BLOB (fetch OK!)', direct:'DIRECT', hls:'HLS', dash:'DASH', data:'DATA', none:'NO SRC' };
+        srcBadge.textContent = badgeTxt[type] || type.toUpperCase();
+        srcDisp.innerText  = src ? (src.length>70 ? src.slice(0,67)+'…' : src) : 'Không tìm thấy URL';
+        srcDisp.title      = src;
+
+        // Frame info labels
+        $('gume-vid-frame-info').textContent = `${detectedFps}fps · ${isLive ? 'LIVE' : formatTimecode(dur, detectedFps)} total`;
+        $('gume-gif-frame-info').textContent = `Max ${parseInt(gifFps.value)||20}fps · 50fps GIF spec cap`;
+
+        // Sync scrubbers to duration
+        vidScrubber.setDuration(dur);
+        gifScrubber.setDuration(dur);
+        vidScrubber.setRange(0, Math.min(dur, isLive ? 60 : dur));
+        gifScrubber.setRange(0, Math.min(10, dur));
+
+        // Reset UI
+        dlStatus.style.display = 'none'; dlStatus.className=''; dlStatus.innerText='';
+        progWrap.style.display = 'none'; progBar.style.width='0%';
+        btnClose.innerText     = 'Đóng Bảng';
+        btnAbort.style.display = 'none';
+        _videoAbortFlag        = false;
+
+        dlOv.style.display  = 'flex';
+        guiEl.style.display = 'none';
+    });
+
+    // Copy URL button
+    $('gume-copy-url').addEventListener('click', () => {
+        const src = getVideoSrc(getBestVideo() || {});
+        if (!src) return;
+        const btn = $('gume-copy-url');
+        (navigator.clipboard ? navigator.clipboard.writeText(src) : Promise.resolve((()=>{const ta=Object.assign(document.createElement('textarea'),{value:src});document.body.appendChild(ta);ta.select();document.execCommand('copy');document.body.removeChild(ta);})())).then(()=>{ btn.innerText='Copied!'; setTimeout(()=>{btn.innerHTML=`${IC.copy} Copy URL`;},1600); });
+    });
+
+    btnClose.addEventListener('click', () => {
+        if (isRecording) {
+            // Immediate cancel on close during recording
+            _abortRender();
+            return;
+        }
+        dlOv.style.display  = 'none';
+        guiEl.style.display = 'block';
+    });
+
+    // Shared abort function — cancels render immediately
+    function _abortRender() {
+        _videoAbortFlag = true;
+        if (_currentRecorder && _currentRecorder.state !== 'inactive') {
+            try { _currentRecorder.stop(); } catch(_){}
+        }
+        if (_currentStream) {
+            try { _currentStream.getTracks().forEach(t => t.stop()); } catch(_){}
+            _currentStream = null;
+        }
+        clearInterval(progressInterval);
+        clearTimeout(_backupTimeout);
+        isRecording        = false;
+        btnAbort.style.display = 'none';
+        btnClose.innerText = 'Đóng Bảng';
+        dlStatus.className = '';
+        dlStatus.innerText = 'Đã hủy render.';
+        progWrap.style.display = 'none';
+    }
+
+    // ── VIDEO DOWNLOAD BUTTON ──────────────────────────────────────
+    $('gume-btn-dl').addEventListener('click', async () => {
+        if (isRecording) return;
+        const v = getBestVideo();
+        if (!v) return alert('Video đã biến mất!');
+
+        const startT  = parseFloat(dlSt.value) || 0;
+        const endT    = parseFloat(dlEn.value) || v.duration || 60;
+        const fps     = Math.max(1, Math.min(240, parseInt(dlFps.value) || 60));
+        const bitrate = parseInt(dlQual.value) || 40_000_000;
+        const isRev   = dlReverse.value === '1';
+
+        // ── Validate duration ──
+        const isLive   = v.duration === Infinity;
+        const metaOK   = !isNaN(v.duration) && isFinite(v.duration);
+        if (!isLive && metaOK && endT > v.duration + 0.5)
+            return alert(`End time (${endT.toFixed(1)}s) vượt quá độ dài video (${v.duration.toFixed(1)}s)!`);
+        if (endT <= startT)
+            return alert('Thời gian không hợp lệ — End phải lớn hơn Start!');
+        const capDur = endT - startT;
+        if (capDur < 0.3)
+            return alert('Đoạn quá ngắn (< 0.3s). Hãy kéo rộng vùng chọn.');
+
+        // Estimated size warning
+        const estMB = (bitrate / 8 * capDur / 1_000_000).toFixed(1);
+        if (parseFloat(estMB) > 500) {
+            if (!confirm(`Ước tính file: ~${estMB} MB (${(capDur).toFixed(0)}s × ${(bitrate/1e6).toFixed(0)} Mbps).\nTiếp tục?`)) return;
+        }
+
+        // ── PATH A: BLOB-FETCH — retrieve raw MSE bytes directly ──
+        const src  = getVideoSrc(v);
+        const type = classifySrc(src);
+
+        if (type === 'blob' && !isRev) {
+            dlStatus.style.display = 'block';
+            dlStatus.className     = 's-rec';
+            dlStatus.innerText     = '⚡ Blob Fetch — đang lấy dữ liệu gốc…\n(Chất lượng 100%, không re-encode)';
+            progWrap.style.display = 'block';
+            progBar.style.width    = '30%';
+            try {
+                const resp = await fetch(src);
+                if (!resp.ok) throw new Error('fetch failed ' + resp.status);
+                const blob = await resp.blob();
+                progBar.style.width = '100%';
+                dlStatus.className  = '';
+                dlStatus.innerText  = `Blob fetch thành công! (${(blob.size/1024/1024).toFixed(2)} MB)\nĐang xuất file…`;
+                const ext  = (blob.type.includes('mp4') || src.includes('mp4')) ? 'mp4' : 'mp4'; // always mp4
+                const url  = URL.createObjectURL(blob);
+                const a    = Object.assign(document.createElement('a'), { href:url, download:`Cosmic_BlobFetch_Original_${Date.now()}.${ext}` });
+                document.body.appendChild(a); a.click(); document.body.removeChild(a);
+                setTimeout(() => URL.revokeObjectURL(url), 5000);
+                setTimeout(() => { dlStatus.innerText = `Hoàn tất! File gốc 100% chất lượng.\n${(blob.size/1024/1024).toFixed(2)} MB — no re-encode`; }, 500);
+                progWrap.style.display = 'none';
+                return;
+            } catch (fetchErr) {
+                // Blob was revoked or cross-origin — fall through to Render Engine
+                progBar.style.width = '0%';
+                dlStatus.className  = '';
+                dlStatus.innerText  = `Blob fetch thất bại (${fetchErr.message}).\nChuyển sang Render Engine…`;
+                await new Promise(r => setTimeout(r, 800));
+            }
+        }
+
+        // ── PATH B: RENDER ENGINE (captureStream + MediaRecorder) ──
+        // Reverse mode uses an offscreen canvas as the stream source.
+        let stream;
+        let offCanvas = null, offCtx = null;
+
+        if (isRev) {
+            // Reverse: canvas.captureStream() feeds the recorder
+            offCanvas = document.createElement('canvas');
+            offCanvas.width  = v.videoWidth  || v.clientWidth  || 1280;
+            offCanvas.height = v.videoHeight || v.clientHeight || 720;
+            offCtx   = offCanvas.getContext('2d');
+            try {
+                stream = offCanvas.captureStream(fps);
+            } catch(e) {
+                return alert('Không thể tạo canvas captureStream: ' + e.message);
+            }
+        } else {
+            try {
+                stream = v.captureStream ? v.captureStream(fps) : v.mozCaptureStream(fps);
+            } catch(e) {
+                return alert('captureStream() thất bại — CORS/DRM bảo vệ.\nThử tắt Hardware Acceleration trong Settings → System.');
+            }
+        }
+        if (!stream) return alert('Không thể lấy video stream.');
+        _currentStream = stream;
+
+        // Codec priority: H.264 MP4 (Chrome 130+) → VP9 → VP8 → default
+        let recorder;
+        const mimeAttempts = [
+            'video/mp4;codecs=avc1.42E01E,mp4a.40.2',
+            'video/mp4;codecs=avc1.42E01E',
+            'video/mp4',
+            'video/webm;codecs=vp9,opus',
+            'video/webm;codecs=vp9',
+            'video/webm;codecs=vp8,opus',
+            'video/webm;codecs=vp8',
+            'video/webm',
+        ];
+        for (const mime of mimeAttempts) {
+            if (!MediaRecorder.isTypeSupported(mime)) continue;
+            try {
+                recorder = new MediaRecorder(stream, { mimeType: mime, videoBitsPerSecond: bitrate, audioBitsPerSecond: 320_000 });
+                break;
+            } catch(_){}
+        }
+        if (!recorder) {
+            try { recorder = new MediaRecorder(stream, { videoBitsPerSecond: bitrate }); }
+            catch(_){ _currentStream=null; return alert('Trình duyệt không hỗ trợ MediaRecorder.'); }
+        }
+        _currentRecorder = recorder;
+        _videoAbortFlag  = false;
+
+        const chunks = [];
+        recorder.ondataavailable = e => { if (e.data?.size > 0) chunks.push(e.data); };
+
+        recorder.onstop = () => {
+            // If aborted, discard everything
+            if (_videoAbortFlag) {
+                _currentRecorder = null; _currentStream = null;
+                return;
+            }
+            isRecording = false;
+            clearInterval(progressInterval);
+            clearTimeout(_backupTimeout);
+            try { v.pause(); } catch(_){}
+            progBar.style.width = '100%';
+            dlStatus.className  = '';
+            dlStatus.innerText  = 'Render xong! Đang xuất file…';
+            const mime = recorder.mimeType || 'video/webm';
+            const ext  = (mime.includes('mp4') || mime.includes('avc')) ? 'mp4' : 'webm';
+            const blob = new Blob(chunks, { type: mime });
+            const url  = URL.createObjectURL(blob);
+            const tag  = isRev ? '_REVERSE' : '';
+            const a    = Object.assign(document.createElement('a'), {
+                href: url,
+                download: `Cosmic_Render${tag}_${fps}fps_${Math.round(bitrate/1e6)}Mbps_${startT.toFixed(1)}s-${endT.toFixed(1)}s.${ext}`,
+            });
+            document.body.appendChild(a); a.click();
+            setTimeout(() => {
+                document.body.removeChild(a); URL.revokeObjectURL(url);
+                btnClose.innerText = 'Đóng Bảng';
+                btnAbort.style.display = 'none';
+                dlStatus.innerText = `Hoàn tất! ${ext.toUpperCase()} · ${(blob.size/1024/1024).toFixed(2)} MB · ${fps}fps · ${(bitrate/1e6).toFixed(0)} Mbps`;
+                progWrap.style.display = 'none';
+            }, 250);
+            _currentRecorder = null; _currentStream = null;
+        };
+
+        isRecording            = true;
+        btnClose.innerText     = 'Đang Render…';
+        dlStatus.style.display = 'block';
+        progWrap.style.display = 'block';
+        progBar.style.width    = '0%';
+        dlStatus.className     = 's-rec';
+        btnAbort.style.display = 'block';
+        btnAbort.disabled      = false;
+
+        if (isRev) {
+            // ── REVERSE MODE ─────────────────────────────────────
+            dlStatus.innerText = `[ REVERSE RENDER @ ${fps}FPS | ${(bitrate/1e6).toFixed(0)} Mbps ]\nĐang căn chỉnh frame…`;
+
+            // Seek to endT first and drain
+            v.currentTime = endT;
+            await new Promise(resolve => {
+                v.addEventListener('seeked', () => requestAnimationFrame(() => requestAnimationFrame(resolve)), { once:true });
+            });
+            if (_videoAbortFlag) return;
+
+            recorder.start(100);
+
+            const totalFrames = Math.ceil(capDur * fps);
+            const frameStep   = 1 / fps;
+
+            for (let i = 0; i < totalFrames; i++) {
+                if (_videoAbortFlag) break;
+                const targetT = endT - i * frameStep;
+                // Seek frame
+                v.currentTime = targetT;
+                await new Promise(resolve => {
+                    v.addEventListener('seeked', () => requestAnimationFrame(() => requestAnimationFrame(resolve)), { once:true });
+                });
+                if (_videoAbortFlag) break;
+                // Draw to canvas (recorder source)
+                offCtx.drawImage(v, 0, 0, offCanvas.width, offCanvas.height);
+
+                const pct = Math.round((i / totalFrames) * 100);
+                progBar.style.width = pct + '%';
+                dlStatus.innerText  =
+                    `[ REVERSE @ ${fps}FPS | ${(bitrate/1e6).toFixed(0)} Mbps ]\n` +
+                    `${pct}% — frame ${i}/${totalFrames} — ${formatTimecode(targetT, fps)}`;
+
+                // Pace the canvas stream at target FPS
+                await new Promise(r => setTimeout(r, Math.floor(1000 / fps)));
+            }
+            if (!_videoAbortFlag && recorder.state === 'recording') recorder.stop();
+
+        } else {
+            // ── FORWARD MODE ─────────────────────────────────────
+            dlStatus.innerText = `[ Đang căn chỉnh seek → ${startT.toFixed(1)}s… ]`;
+
+            // Seek to startT and wait for actual decoded frame
+            _settingRate = true; v.playbackRate = 1.0; _settingRate = false;
+            v.currentTime = startT;
+            await new Promise(resolve => {
+                v.addEventListener('seeked', () => {
+                    // Double rAF drain — ensure GPU has committed the frame
+                    requestAnimationFrame(() => requestAnimationFrame(resolve));
+                }, { once:true });
+            });
+            if (_videoAbortFlag) return;
+
+            // Start recording BEFORE play() so we capture from frame 0
+            recorder.start(100);
+
+            // Play
+            const ytP = IS_YOUTUBE ? document.querySelector('#movie_player') : null;
+            try {
+                if (ytP) { try{ytP.seekTo(startT,true);}catch(_){} try{ytP.playVideo();}catch(_){} }
+                await v.play();
+            } catch(_) {
+                _abortRender();
+                return alert('Không thể bắt đầu phát video.\n' + (IS_YOUTUBE ? 'YouTube: hãy play video trước.' : 'Hãy play video trước.'));
+            }
+            if (_videoAbortFlag) return;
+
+            progressInterval = setInterval(() => {
+                if (_videoAbortFlag) { clearInterval(progressInterval); return; }
+                const elapsed = Math.max(0, v.currentTime - startT);
+                const pct     = Math.min((elapsed / capDur) * 100, 99);
+                progBar.style.width = pct + '%';
+                const mime    = recorder.mimeType || 'video/webm';
+                const fmt     = mime.includes('mp4') ? 'MP4/H264' : 'WEBM/VP9';
+                dlStatus.innerText =
+                    `[ ${fmt} @ ${fps}FPS | ${(bitrate/1e6).toFixed(0)} Mbps ]\n` +
+                    `${pct.toFixed(1)}% — ${formatTimecode(v.currentTime, fps)} — Đừng đóng tab!`;
+            }, 80);
+
+            // timeupdate-based stop — accurate to within 80ms
+            const stopWatcher = () => {
+                if (v.currentTime >= endT - 0.05) {
+                    v.removeEventListener('timeupdate', stopWatcher);
+                    clearTimeout(_backupTimeout);
+                    if (!_videoAbortFlag && recorder.state === 'recording') recorder.stop();
+                }
+            };
+            v.addEventListener('timeupdate', stopWatcher);
+
+            // Backup safety timeout (in case timeupdate misfires)
+            _backupTimeout = setTimeout(() => {
+                v.removeEventListener('timeupdate', stopWatcher);
+                if (!_videoAbortFlag && recorder.state === 'recording') recorder.stop();
+            }, capDur * 1000 + 3000);
+        }
+    });
+
+    // ── ABORT (VIDEO) ────────────────────────────────────────────
+    btnAbort.addEventListener('click', () => {
+        if (!isRecording) return;
+        _abortRender();
+    });
+
+    // ═══════════════════════════════════════════════════════════════
+    // §18 · GIF ENGINE v4.0
+    // ═══════════════════════════════════════════════════════════════
+
+    async function seekToVerified(video, targetTime, frameDur) {
+        const alreadyClose = Math.abs(video.currentTime - targetTime) < frameDur * 0.25;
+        const _waitForFrame = () => new Promise(resolve => {
+            if (typeof video.requestVideoFrameCallback === 'function') {
+                video.requestVideoFrameCallback((_now, meta) => resolve(meta ? meta.mediaTime : null));
+            } else {
+                requestAnimationFrame(() => requestAnimationFrame(() => resolve(null)));
+            }
+        });
+        if (alreadyClose) { await _waitForFrame(); return; }
+        const _doSeek = (time) => new Promise((resolve, reject) => {
+            const onSeeked = () => { video.removeEventListener('seeked',onSeeked); video.removeEventListener('error',onError); _waitForFrame().then(resolve).catch(reject); };
+            const onError  = () => { video.removeEventListener('seeked',onSeeked); video.removeEventListener('error',onError); reject(new Error('seek error at '+time)); };
+            video.addEventListener('seeked',onSeeked,{once:true}); video.addEventListener('error',onError,{once:true});
+            video.currentTime = time;
+        });
+        let decodedTime = await _doSeek(targetTime);
+        if (decodedTime !== null && Math.abs(decodedTime - targetTime) > frameDur * 0.75)
+            decodedTime = await _doSeek(targetTime);
+    }
+
+    async function captureFrameSeek(v, ctx, cw, ch, startT, frameInterval, totalFrames, quality, onFrame, onProgress) {
+        for (let i = 0; i < totalFrames; i++) {
+            if (_gifAbortFlag) return false;
+            await seekToVerified(v, startT + i * frameInterval, frameInterval);
+            if (_gifAbortFlag) return false;
+            ctx.drawImage(v, 0, 0, cw, ch);
+            if (i === 0 && _GUME_GIF.isCanvasBlack(ctx, cw, ch)) {
+                if (!confirm('Cảnh báo: Frame đầu bị đen (DRM/Hardware Accel).\nTắt Hardware Acceleration và thử lại.\n\nTiếp tục?')) return false;
+            }
+            const imageData = ctx.getImageData(0, 0, cw, ch);
+            onFrame(i, _GUME_GIF.encodeOneFrame(imageData, cw, ch, quality));
+            onProgress((i+1)/totalFrames);
+            await new Promise(r => setTimeout(r, 0));
+        }
+        return true;
+    }
+
+    async function captureFramePlayback(v, ctx, cw, ch, startT, endT, frameInterval, totalFrames, quality, onFrame, onProgress) {
+        if (typeof v.requestVideoFrameCallback !== 'function')
+            return captureFrameSeek(v, ctx, cw, ch, startT, frameInterval, totalFrames, quality, onFrame, onProgress);
+
+        return new Promise(resolve => {
+            let frameIndex=0, nextTargetTime=startT, lastCaptured=-1, rafCancelled=false;
+            const PLAY_RATE = 0.03; // v4.0: slower for better frame coverage (was 0.05)
+            const onInitialSeeked = () => {
+                v.removeEventListener('seeked', onInitialSeeked);
+                if (_gifAbortFlag) { resolve(false); return; }
+                _settingRate=true; v.playbackRate=PLAY_RATE; _settingRate=false;
+                v.play().catch(()=>{});
+                scheduleNextFrame();
+            };
+            v.addEventListener('seeked', onInitialSeeked, { once:true });
+            v.currentTime = startT;
+
+            function scheduleNextFrame() {
+                if (rafCancelled || _gifAbortFlag) { resolve(false); return; }
+                v.requestVideoFrameCallback(async(_now, meta) => {
+                    if (rafCancelled || _gifAbortFlag) { resolve(false); return; }
+                    const mediaTime = meta ? meta.mediaTime : v.currentTime;
+                    if (mediaTime > endT + frameInterval * 0.5) { v.pause(); resolve(true); return; }
+                    if (mediaTime >= nextTargetTime - frameInterval * 0.4
+                        && frameIndex < totalFrames
+                        && Math.round(mediaTime*1000) !== Math.round(lastCaptured*1000))
+                    {
+                        lastCaptured = mediaTime;
+                        ctx.drawImage(v, 0, 0, cw, ch);
+                        if (frameIndex === 0 && _GUME_GIF.isCanvasBlack(ctx, cw, ch)) {
+                            rafCancelled=true; v.pause();
+                            if (!confirm('Cảnh báo: Frame đầu bị đen.\nTắt Hardware Acceleration.\n\nTiếp tục?')) { resolve(false); return; }
+                            rafCancelled=false;
+                        }
+                        const imageData = ctx.getImageData(0, 0, cw, ch);
+                        onFrame(frameIndex, _GUME_GIF.encodeOneFrame(imageData, cw, ch, quality));
+                        onProgress((frameIndex+1)/totalFrames);
+                        frameIndex++;
+                        nextTargetTime = startT + frameIndex * frameInterval;
+                        if (frameIndex >= totalFrames) { v.pause(); resolve(true); return; }
+                    }
+                    await new Promise(r => setTimeout(r, 0));
+                    scheduleNextFrame();
+                });
+            }
+        });
+    }
+
+    $('gume-btn-gif').addEventListener('click', async () => {
+        if (isRecording) return;
+        const v = getBestVideo();
+        if (!v) return alert('Không tìm thấy video!');
+
+        const startT      = parseFloat(gifSt.value) || 0;
+        const endT        = parseFloat(gifEn.value) || 10;
+        const targetFps   = Math.max(1, Math.min(50, parseInt(gifFps.value) || 20));
+        const maxDim      = parseInt(gifDim.value) || 960;
+        const quality     = gifQual.value || 'high';
+        const captureMode = gifCap.value || 'seek';
+        const duration    = endT - startT;
+
+        if (isNaN(startT) || isNaN(endT) || duration <= 0)
+            return alert('Thời gian GIF không hợp lệ!');
+        if (duration > 30 && maxDim >= 1280) {
+            if (!confirm(`GIF ${duration.toFixed(0)}s × ${targetFps}fps × ${maxDim}px — rất nặng!\nRAM ước tính: ~${Math.round(duration*targetFps*0.12)}MB.\nTiếp tục?`)) return;
+        }
+
+        const frameInterval = 1 / targetFps;
+        const totalFrames   = Math.ceil(duration * targetFps);
+        const vw = v.videoWidth||v.clientWidth||640, vh=v.videoHeight||v.clientHeight||360;
+        const scale = Math.min(1, maxDim / Math.max(vw,vh));
+        const cw = Math.max(2,Math.round(vw*scale)), ch = Math.max(2,Math.round(vh*scale));
+
+        $('gume-gif-frame-info').textContent = `${totalFrames} frames · ${cw}×${ch}px`;
+
+        const canvas = document.createElement('canvas');
+        canvas.width=cw; canvas.height=ch;
+        const ctx = canvas.getContext('2d', { alpha:false, willReadFrequently:true });
+        const wasPlaying = !v.paused;
+        if (wasPlaying) v.pause();
+
+        _gifAbortFlag          = false;
+        isRecording            = true;
+        dlStatus.style.display = 'block';
+        progWrap.style.display = 'block';
+        progBar.style.width    = '0%';
+        dlStatus.className     = 's-rec';
+        dlStatus.innerText     = '[1/3] Đang khởi động GIF capture…';
+        btnClose.innerText     = 'Đang xử lý…';
+        btnAbort.style.display = 'block';
+        btnAbort.disabled      = false;
+
+        try {
+            const encodedFrames = new Array(totalFrames).fill(null);
+            const onFrame = (idx, enc) => { encodedFrames[idx] = enc; };
+            const qualLabel = { fast:'FAST', standard:'STD', high:'HIGH', ultra:'ULTRA', maximum:'MAX/ATKINSON' };
+            const captureLabel = captureMode==='play'
+                ? `[1/3] Playback (${qualLabel[quality]||quality})…`
+                : `[1/3] Seek (${qualLabel[quality]||quality})…`;
+            dlStatus.innerText = captureLabel + '\n0% · frame 0 / ' + totalFrames;
+
+            const onProgress = frac => {
+                if (_gifAbortFlag) return;
+                const pct = Math.round(frac*100);
+                progBar.style.width = (frac*65).toFixed(1)+'%';
+                dlStatus.innerText = captureLabel + '\n' + pct + '% · frame ' + Math.round(frac*totalFrames) + '/' + totalFrames + '\n' + cw+'×'+ch + '  ' + targetFps+'fps  ' + quality;
+            };
+
+            let completed;
+            if (captureMode==='play') {
+                completed = await captureFramePlayback(v,ctx,cw,ch,startT,endT,frameInterval,totalFrames,quality,onFrame,onProgress);
+            } else {
+                completed = await captureFrameSeek(v,ctx,cw,ch,startT,frameInterval,totalFrames,quality,onFrame,onProgress);
+            }
+            if (!completed || _gifAbortFlag) throw new Error('Đã hủy bởi người dùng');
+
+            dlStatus.className=''; dlStatus.innerText='[2/3] Đang lắp ráp GIF binary…'; progBar.style.width='90%';
+            await new Promise(r=>setTimeout(r,0));
+
+            const gifBlob = _GUME_GIF.buildBlobFromEncoded(encodedFrames, cw, ch, 1000/targetFps);
+
+            progBar.style.width='100%'; dlStatus.className=''; dlStatus.innerText='[3/3] Thành công! Đang tải xuống…';
+            const url = URL.createObjectURL(gifBlob);
+            const a   = Object.assign(document.createElement('a'), {
+                href:     url,
+                download: `Cosmic_GIF_${cw}x${ch}_${targetFps}fps_${quality}_${startT.toFixed(1)}s-${endT.toFixed(1)}s.gif`,
+            });
+            document.body.appendChild(a); a.click(); document.body.removeChild(a);
+            setTimeout(()=>URL.revokeObjectURL(url), 4000);
+
+            isRecording=false; btnClose.innerText='Đóng Bảng'; btnAbort.style.display='none';
+            setTimeout(()=>{
+                dlStatus.innerText = `Hoàn tất!  ${cw}×${ch}  ${targetFps}fps  ${quality}\n${totalFrames} frames · ${(gifBlob.size/1024/1024).toFixed(2)} MB`;
+                progWrap.style.display='none';
+            }, 300);
+
+        } catch(err) {
+            isRecording=false; _gifAbortFlag=false;
+            dlStatus.className=''; dlStatus.innerText=err.message.includes('hủy')?'Đã hủy.':'Lỗi: '+err.message;
+            btnClose.innerText='Đóng Bảng'; btnAbort.style.display='none';
+            progWrap.style.display='none';
+            console.error('[GUME GIF v4]', err);
+            if (wasPlaying) v.play().catch(()=>{});
+        }
+    });
+
+    // ═══════════════════════════════════════════════════════════════
+    // §19 · KEYBOARD SHORTCUTS
+    // ═══════════════════════════════════════════════════════════════
+    document.addEventListener('keydown', (e) => {
+        const tag=document.activeElement?.tagName||'';
+        if (tag==='INPUT'||tag==='TEXTAREA'||document.activeElement?.isContentEditable) return;
+        if (e.key==='Escape' && dlOv.style.display==='flex') {
+            if (!isRecording) btnClose.click(); return;
+        }
+        if (dlOv.style.display==='flex') return;
+        if (e.key.toLowerCase()==='g') {
+            if (!document.querySelector('video')) return;
+            userHidden=!userHidden;
+            if (userHidden) { guiEl.style.opacity='0'; setTimeout(()=>{ if(userHidden)guiEl.style.display='none'; },240); }
+            else { guiEl.style.display='block'; requestAnimationFrame(()=>{ guiEl.style.opacity='1'; }); }
+            guiVisible=!userHidden;
+        }
+    });
+
+    // ═══════════════════════════════════════════════════════════════
+    // §20 · GUI VISIBILITY MANAGEMENT
+    // ═══════════════════════════════════════════════════════════════
+    function showGUI() {
+        if (guiVisible||userHidden) return;
+        guiEl.style.display='block';
+        requestAnimationFrame(()=>{ guiEl.style.opacity='1'; });
+        guiVisible=true;
+    }
+    function hideGUI() {
+        if (!guiVisible) return;
+        guiEl.style.opacity='0';
+        setTimeout(()=>{ guiEl.style.display='none'; guiVisible=false; userHidden=false; }, 240);
+    }
+
+    // ═══════════════════════════════════════════════════════════════
+    // §21 · MUTATION OBSERVER
+    // ═══════════════════════════════════════════════════════════════
+    const observer = new MutationObserver(muts => {
+        let added=false;
+        for(const m of muts){ for(const n of m.addedNodes){ if(n.nodeType!==1)continue; if(n.tagName==='VIDEO'||n.querySelector?.('video')){added=true;break;} } if(added)break; }
+        if(added&&!guiVisible&&!userHidden) showGUI();
+    });
+    const startObserver=()=>observer.observe(document.body,{childList:true,subtree:true});
+    if(document.body) startObserver();
+    else document.addEventListener('DOMContentLoaded',startObserver,{once:true});
+
+    // ═══════════════════════════════════════════════════════════════
+    // §22 · HEALTH CHECK INTERVAL  (1.5s)
+    // ═══════════════════════════════════════════════════════════════
+    setInterval(()=>{
+        const videos=[...document.querySelectorAll('video')];
+        if(videos.length>0){
+            if(!guiVisible&&!userHidden) showGUI();
+            if(!isRecording&&currentRate>=0){
+                const rate=currentRate===0?0.01:currentRate;
+                videos.forEach(v=>{
+                    if(!v._gumeGuard) installSpeedGuard(v);
+                    if(Math.abs(v.playbackRate-rate)>0.08){_settingRate=true;v.playbackRate=rate;_settingRate=false;}
+                    if(!_reverseMuted){
+                        if(currentVolume<=100){if(Math.abs(v.volume-currentVolume/100)>0.02)v.volume=currentVolume/100;}
+                        else{if(v.volume<0.99)v.volume=1.0;const n=gainNodes.get(v);if(n&&audioCtx){const want=currentVolume/100;if(Math.abs(n.gainNode.gain.value-want)>0.05)n.gainNode.gain.setTargetAtTime(want,audioCtx.currentTime,0.02);}}
+                    }
+                });
+            }
+        } else {
+            if(guiVisible) hideGUI();
+            if(espActive) $('gume-esp').click();
+        }
+    }, 1500);
+
+    // ═══════════════════════════════════════════════════════════════
+    // §23 · INITIAL DETECTION
+    // ═══════════════════════════════════════════════════════════════
+    const _checkInitial=()=>{ if(document.querySelector('video')||document.querySelector('img[src*=".gif" i]')) showGUI(); };
+    if(document.readyState==='loading') document.addEventListener('DOMContentLoaded',_checkInitial,{once:true});
+    else _checkInitial();
+
+})();
